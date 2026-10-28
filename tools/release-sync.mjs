@@ -114,6 +114,13 @@ function normalizeBody(body) {
   return String(body || '').replace(/\r\n/g, '\n').trimEnd();
 }
 
+export function compareReleaseTags(left, right) {
+  const leftIsHistory = left.startsWith('history-');
+  const rightIsHistory = right.startsWith('history-');
+  if (leftIsHistory !== rightIsHistory) return leftIsHistory ? -1 : 1;
+  return left.localeCompare(right, 'en', { numeric: true, sensitivity: 'base' });
+}
+
 function sha256(buffer) {
   return createHash('sha256').update(buffer).digest('hex').toUpperCase();
 }
@@ -232,7 +239,9 @@ export async function synchronize({
   ]);
   const githubByTag = new Map(githubReleases.map((release) => [release.tag_name, release]));
   const giteeByTag = new Map(giteeReleases.map((release) => [release.tag_name, release]));
-  const tags = tag ? [tag] : [...new Set([...githubByTag.keys(), ...giteeByTag.keys()])].sort();
+  // Gitee lists releases by creation time. Recreate missing history in version
+  // order so filling a gap cannot put v2.9 after v2.10 or obscure the latest release.
+  const tags = tag ? [tag] : [...new Set([...githubByTag.keys(), ...giteeByTag.keys()])].sort(compareReleaseTags);
 
   if (tag && !githubByTag.has(tag) && !giteeByTag.has(tag)) {
     throw new Error(`两个平台都没有 Release ${tag}`);

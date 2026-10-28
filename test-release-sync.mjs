@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { synchronize } from './tools/release-sync.mjs';
+import { compareReleaseTags, synchronize } from './tools/release-sync.mjs';
 
 function release(tag, body = 'michaelqiu 出品') {
   const assetName = `Doc-Internal-Word-Remover-${tag}.zip`;
@@ -93,4 +93,9 @@ const common = {
   await assert.rejects(() => synchronize(common), /正文不一致/);
 }
 
-console.log('release sync: 4/4 passed');
+assert.deepEqual(
+  ['history-v4.10', 'v4.78.1', 'history-v2.10', 'history-v4.9', 'history-v2.9'].sort(compareReleaseTags),
+  ['history-v2.9', 'history-v2.10', 'history-v4.9', 'history-v4.10', 'v4.78.1'],
+);
+
+console.log('release sync: 5/5 passed');
