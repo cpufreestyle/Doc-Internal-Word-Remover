@@ -1,0 +1,17 @@
+# 统一行尾策略：跨平台工具，源码/脚本一律 LF，仅 Windows 批处理保留 CRLF。
+# 尤其重要：Start.sh / 文档敏感词清除工具.desktop 若被检出为 CRLF，
+# 在 UOS / Linux 上会直接报 `bash: $'\r': command not found`。
+* text=auto
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.json text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.sh     text eol=lf
+*.desktop text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf

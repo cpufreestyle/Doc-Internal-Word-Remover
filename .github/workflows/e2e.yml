@@ -1,0 +1,42 @@
+name: E2E
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'index.html'
+      - 'js/**'
+      - 'css/**'
+      - 'test-e2e.mjs'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm i -D playwright@1.48.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium
+
+      - name: Start static server
+        run: |
+          python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
+          sleep 2
+
+      - name: Run E2E smoke
+        run: node test-e2e.mjs

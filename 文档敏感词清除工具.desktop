@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=文档敏感词批量清除工具
+Name[en]=Doc Internal Word Remover
+Comment=批量清除文档首尾行的涉密标识（涉密/内部/秘密/机密/绝密），纯本地运行，数据不出本机
+Comment[en]=Batch-remove sensitive words from documents locally
+Exec=bash -c 'cd "$(dirname %k)" && bash Start.sh'
+Icon=app-icon
+Terminal=true
+Type=Application
+Categories=Office;Utility;
+StartupNotify=true

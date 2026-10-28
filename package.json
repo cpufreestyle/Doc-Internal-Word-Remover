@@ -1,0 +1,27 @@
+{
+  "name": "doc-internal-word-remover",
+  "version": "4.78.1",
+  "private": true,
+  "description": "文档敏感词清除工具：Word/Excel/PowerPoint 与文本文件的敏感词扫描、清除与报告解析（零运行时依赖）",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node test-allparts.mjs && node test-roundtrip.mjs && node test-coverage.mjs && node test-concurrency.mjs && node test-report.mjs && node test-formats.mjs && node test-rules.mjs && node test-security.mjs && node test-app.mjs && node tools/check-public.mjs",
+    "test:all": "npm test",
+    "test:app": "node test-app.mjs",
+    "test:concurrency": "node test-concurrency.mjs",
+    "test:coverage": "node test-coverage.mjs",
+    "test:formats": "node test-formats.mjs",
+    "test:report": "node test-report.mjs",
+    "test:roundtrip": "node test-roundtrip.mjs",
+    "test:rules": "node test-rules.mjs",
+    "test:security": "node test-security.mjs",
+    "test:public": "node tools/check-public.mjs",
+    "test:parts": "node test-allparts.mjs",
+    "test:e2e": "node test-e2e.mjs",
+    "scan": "node scan.mjs"
+  }
+}

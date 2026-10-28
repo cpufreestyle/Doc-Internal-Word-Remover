@@ -1,0 +1,75 @@
+# 工具输出与临时文件
+*.exe
+*.bak
+*.zip
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 依赖（如本地服务器用到）
+node_modules/
+
+# 构建中间产物：启动器资源段（由 tools/build-launcher.* 从 assets/app-icon.ico 生成）
+tools/launcher/*.syso
+
+# 用户输出目录（脱敏产物与扫描报告：含真实路径/文档，不纳入版本库）
+_已脱敏/
+cleaned/
+output/
+demo/
+release-artifacts/
+release-check*/
+scan-report.json
+scan-report.csv
+scan-report.html
+Z-*.json
+Z-*.csv
+Z-*.html
+Z-*.png
+_nul_cleaned/
+
+# UI 实测截图（历史设计参考，不入库）
+设计参考/
+
+# 二进制分析工作区（含第三方样本与分析结果，不入库）
+_rea/
+_v38report.png
+_v39report.png
+
+# 临时说明文件与本地测试日志（不应入库）
+diag-out.txt
+*.mp4
+.playwright-cli/
+.qoder-credits/
+_cmsg*.txt
+_t*.log
+_sum*.txt
+_rhp.txt
+
+# 本地一次性脚本 / 探针（调试用，不入库）
+_ins.cjs
+_rd.cjs
+_run*.cjs
+_reg*.cjs
+_regcheck.ps1
+_pw.cjs
+_srv.cjs
+_struct.cjs
+_pscheck.ps1
+_psres.json
+probe_z*.py
+
+# 本地诊断 / 教程脚本与扫描样本（含真实路径，不入库）
+tools/_probe.mjs
+tools/analyze_z.py
+tools/diag*
+tools/narrate.ps1
+tools/record-tutorial.mjs
+tools/voice-server.mjs
+tools/z_diag.txt
+tools/zdiag.py
+
+# 编辑器 / 启动器交换文件（形如 启动工具.exe~，运行中被锁）
+*~

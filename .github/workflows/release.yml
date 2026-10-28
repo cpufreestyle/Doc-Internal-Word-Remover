@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Inject version into page
+        run: |
+          sed -i "s/__DWR_VERSION__/${GITHUB_REF_NAME}/" index.html
+
+      - name: Embed icon into launcher
+        run: |
+          # 给 启动工具.exe 嵌入程序图标与清单（EXE 在资源管理器 / 任务栏显示的图标）
+          go install github.com/akavel/rsrc@latest
+          "$(go env GOPATH)/bin/rsrc" -arch 386 -ico assets/app-icon.ico -manifest tools/launcher/app.manifest -o tools/launcher/rsrc_windows_386.syso
+
+      - name: Package web app
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          # 启动器 EXE：32 位静态编译，Win7（x86/x64）到 Win11 均可运行，不依赖任何运行时
+          # （模块在 tools/launcher 下，需在该目录内构建）
+          ( cd tools/launcher && CGO_ENABLED=0 GOOS=windows GOARCH=386 go build \
+              -trimpath -ldflags="-s -w -X main.buildVersion=${VER}" \
+              -o "$GITHUB_WORKSPACE/启动工具.exe" . )
+
+          zip -r "Doc-Internal-Word-Remover-${VER}.zip" index.html Start.bat Start.sh "文档敏感词清除工具.desktop" scan.mjs 启动工具.exe README.md README_EN.md CHANGELOG.md SECURITY.md CONTRIBUTING.md ACCESSIBILITY.md manifest.json sw.js LICENSE css js tools assets
+          echo "ZIP=Doc-Internal-Word-Remover-${VER}.zip" >> "$GITHUB_ENV"
+
+      - name: Generate release notes
+        run: |
+          VER="${GITHUB_REF_NAME}"
+          ZIP="Doc-Internal-Word-Remover-${VER}.zip"
+          HASH=$(sha256sum "$ZIP" | awk '{print $1}')
+          {
+            echo "## Doc-Internal-Word-Remover $VER"
+            echo ""
+            echo "纯前端、零依赖、数据不出本机的文档敏感词批量清除工具，默认只处理文档首行 / 尾行。"
+            echo ""
+            echo "michaelqiu 出品"
+            echo ""
+            echo "### 支持格式"
+            echo "- Office OOXML 全变体：\`docx / docm / dotx / dotm\`、\`xlsx / xlsm / xltx / xltm\`、\`pptx / pptm / potx / potm / ppsx / ppsm\`"
+            echo "- 文本类：\`txt / md / csv / tsv / json / xml / html / log / ini / yaml / sql / 各类源码与配置\`"
+            echo ""
+            echo "### 本次更新"
+          # 本次更新从 CHANGELOG.md 对应小节自动截取（tag v2.88.0 -> 小节 ## v2.88），
+          # 取代原先写死在 workflow 里的旧条目：发版只需更新 CHANGELOG。
+          SHORT=$(echo "${VER#v}" | cut -d. -f1,2)
+          awk -v ver="$SHORT" -f tools/changelog-section.awk CHANGELOG.md
+          echo ""
+            echo ""
+            echo "### 下载"
+            echo "- **$ZIP**：解压后双击 index.html，用 Chrome / Edge 打开即可使用（无需安装、数据不出本机）。"
+            echo ""
+            echo "### 校验 (SHA256)"
+            echo '```'
+            echo "$HASH"
+            echo '```'
+            echo ""
+            echo "### 使用"
+            echo "- Windows 网页版：双击 启动工具.exe（32 位静态启动器，Win7 32/64 位到 Win11 均可运行，无需 Python / Node）；或双击 Start.bat 一键启动本地服务（自动探测端口，默认 http://127.0.0.1:8080，被占用则自动顺延）。"
+            echo "- 按检查报告批量脱敏：node scan.mjs --from-report report.html --authorized-root /path/to/documents --out cleaned（支持通用 HTML 报告 / JSON / 纯路径清单）。"
+            echo "- UOS / Linux 网页版：bash Start.sh，或双击 文档敏感词清除工具.desktop。"
+            echo "- 命令行：node scan.mjs --drive D: --clean --out cleaned（Windows，需 Node.js 18+）。"
+            echo "- 命令行：node scan.mjs --drive /home --clean --out cleaned（UOS / Linux）。"
+            echo "- 命令行按报告脱敏：node scan.mjs --from-report <报告.html|json|txt> --authorized-root <授权目录> --out cleaned。"
+            echo ""
+            echo "### 质量"
+            echo "本版本已通过 9 个零依赖回归测试套件（\`test-allparts\` / \`test-roundtrip\` / \`test-coverage\` / \`test-concurrency\` / \`test-report\` / \`test-formats\` / \`test-rules\` / \`test-security\` / \`test-app\`）。"
+          } > notes.md
+
+      - name: Guard empty release notes section
+        run: |
+          # CHANGELOG 未写当前版本小节时，避免「本次更新」下方是空白。
+          if ! grep -q "^- " notes.md; then
+            sed -i "s|^### 本次更新$|### 本次更新\\n- 本次变更见 [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)。|" notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          body_path: notes.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

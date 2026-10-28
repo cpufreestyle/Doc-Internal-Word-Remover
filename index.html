@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="dwr-version" content="__DWR_VERSION__">
+  <meta name="description" content="纯本地运行的文档敏感词批量清除工具：Word / Excel / PPT 与文本文件，拖入即可扫描、预览、脱敏，数据不出本机。">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <link rel="icon" type="image/svg+xml" href="assets/app-icon.svg">
+  <link rel="icon" type="image/x-icon" href="assets/app-icon.ico">
+  <title>文档敏感词批量清除工具</title>
+  <link rel="stylesheet" href="css/style.css?v=__DWR_VERSION__">
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0066cc">
+  <script>
+    /* 主题在首帧前落地，避免刷新闪白；localStorage 记忆，未设置时跟随系统 */
+    (function () {
+      try {
+        var t = localStorage.getItem("dwr.theme");
+        if (t !== "dark" && t !== "light") {
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+        }
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) { /* 隐私模式等场景静默降级为浅色 */ }
+    })();
+  </script>
+</head>
+
+<body>
+  <script>
+    /* v2.83: Service Worker 注册（本地服务器场景生效；file:// 打开自动静默） */
+    if ("serviceWorker" in navigator && location.protocol !== "file:") {
+      navigator.serviceWorker.register("./sw.js").catch(function () { /* 注册失败静默降级 */ });
+    }
+  </script>
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="logo"><img src="assets/app-icon.svg" alt="" width="34" height="34" decoding="async"></div>
+        <div class="brand-text">
+          <h1>文档密级词清理</h1>
+          <p>Word / Excel / PPT 拖进来就能检查 · 文件只在本地处理</p>
+        </div>
+      </div>
+      <div class="header-side">
+        <button type="button" class="theme-toggle" id="themeBtn" data-tip="切换深色 / 浅色主题">深色</button>
+        <span class="ver" id="appVersion" hidden></span>
+        <span id="envBadge" class="badge">环境检测中…</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="notice">
+    <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" focusable="false" style="flex:none;"><path d="M8 1.6l6.4 11.2H1.6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="11.4" r="0.9" fill="currentColor"/></svg>
+    <span>图片文字、PDF、旧版 Office、宏与嵌入对象不处理；无命中不等于安全，重要文件请人工复核。</span>
+  </div>
+
+  <main class="layout">
+    <!-- 左栏：配置 -->
+    <aside class="panel-column">
+      <details class="card auxiliary-card" id="diskScanTools">
+        <summary data-tip="批量找出带敏感词的文档，扫描只读不改文件；整盘排查时使用">
+          <span>整盘只读扫描</span><span class="aux-badge">可选</span>
+        </summary>
+        <div class="btn-row">
+          <button type="button" class="mini" id="scanFolderBtn" data-tip="选一个文件夹，批量找出带敏感词的文档，不改动文件。网络盘（UNC）请用命令行扫描后导入报告">扫描文件夹…</button>
+          <button type="button" class="mini" id="scanDrivesBtn" data-tip="一次选多个盘 / 目录，选完一起扫描（整机排查用）">扫描所有存储…</button>
+          <button type="button" class="mini" id="stopScanBtn" disabled data-tip="立刻停止本次扫描，已扫出的结果会保留">停止扫描</button>
+        </div>
+        <div class="btn-row" id="drivePickRow" style="display:none;margin-top:8px;">
+          <span class="hint" id="drivePickHint" style="margin:0;">已选 0 个位置</span>
+          <span class="spacer"></span>
+          <button type="button" class="mini" id="driveQuickBtn" data-tip="按盘符快选：列出 D: 到 Z: 按钮，点哪个就选哪个盘根目录，不用翻文件树">盘符快选</button>
+          <button type="button" class="mini" id="driveAddBtn" data-tip="再选一个盘或文件夹加入本次扫描">继续添加…</button>
+          <button type="button" class="mini danger" id="driveClearBtn" data-tip="清空已选的位置，重新挑">清空</button>
+          <button type="button" class="primary" id="driveStartBtn" disabled data-tip="按列表依次扫描全部已选位置">开始扫描</button>
+        </div>
+        <div class="btn-row" id="uncPickRow" style="display:none;margin-top:8px;">
+          <input type="text" id="uncPathInput" placeholder="\\server\share" data-tip="直接输入网络盘或任意路径；浏览器选不了网络位置，这里填路径即可" aria-label="输入网络盘或文件夹路径">
+          <button type="button" class="mini" id="uncAddBtn" data-tip="把上面填的路径加入本次扫描">添加</button>
+        </div>
+        <button type="button" class="mini more-settings" id="scanSettingsBtn" aria-expanded="false" data-tip="展开扫描上限 / 深度 / 跳过系统目录、清除目录记忆、导入检查报告等次要选项">更多扫描设置…</button>
+        <div id="scanSettingsBody" hidden style="margin-top:8px;">
+          <div class="field">
+            <label data-tip="单次扫描最多检查多少个文件，超出会停下">扫描文件数上限</label>
+            <input type="number" id="scanMaxFiles" value="5000" min="100" step="100" data-tip="单次扫描最多检查多少个文件" aria-label="扫描文件数上限">
+          </div>
+          <div class="field">
+            <label data-tip="向下扫描几层子文件夹">子文件夹深度</label>
+            <input type="number" id="scanMaxDepth" value="8" min="1" max="20" data-tip="向下扫描几层子文件夹" aria-label="子文件夹深度">
+          </div>
+          <label class="switch" data-tip="跳过 node_modules、.git、系统缓存等目录，扫描更快"><input type="checkbox" id="scanSkipSys" checked> 跳过系统和依赖文件夹</label>
+          <div class="field">
+            <label data-tip="默认只扫常用办公文档，速度快、命中率高；可选全部支持格式，或自己填扩展名">文件格式</label>
+            <select id="scanExtPreset" data-tip="主流格式：docx / xlsx / pptx / txt / md 等常用文档；全部支持格式：含源码与配置，慢但最全；自定义：按右边填的扩展名扫" aria-label="文件格式筛选">
+              <option value="common">主流格式（推荐）</option>
+              <option value="all">全部支持格式</option>
+              <option value="custom">自定义</option>
+            </select>
+          </div>
+          <div class="field" id="scanExtCustomWrap" style="display:none;">
+            <label data-tip="用逗号分隔，可带点也可不带；如 docx, xlsx, txt">自定义扩展名</label>
+            <input type="text" id="scanExtCustom" placeholder="docx, xlsx, txt" data-tip="只扫这些扩展名；用逗号分隔，带点不带点都认" aria-label="自定义扩展名">
+          </div>
+          <div class="field">
+            <label data-tip="按文件名筛一遍，文件名不含这些词的文件直接不读">文件名关键字</label>
+            <input type="text" id="scanNameWords" placeholder="如 台账, 报表（留空则不筛）" data-tip="只扫文件名含这些词的文件；多个词用逗号分隔，大小写不敏感。不读文件就能判掉，省大量时间" aria-label="文件名关键字">
+          </div>
+          <div class="field">
+            <label data-tip="任一包含：命中任一词就算；全部包含：每个词都要在文件名里出现">匹配方式</label>
+            <select id="scanNameMode" data-tip="任一包含较宽松，全部包含更严格" aria-label="文件名关键字匹配方式">
+              <option value="or">任一包含</option>
+              <option value="and">全部包含</option>
+            </select>
+          </div>
+          <button type="button" class="mini" id="clearDirMemBtn" data-tip="清除已记住的扫描、磁盘和保存目录">清除目录记忆</button>
+          <div class="btn-row" style="margin-top:8px;">
+            <button type="button" class="mini" id="importReportBtn" data-tip="支持 HTML、JSON 或 TXT 清单；导入后会按当前词库复查">导入报告…</button>
+            <input type="file" id="reportFile" accept=".html,.htm,.txt,.json" multiple hidden>
+          </div>
+        </div>
+      </details>
+      <details class="card card-primary settings-card" id="rulesCard">
+        <summary data-tip="要清除的敏感词；点这里展开后可停用、添加或编辑词条">
+          <span class="settings-title">敏感词库</span>
+          <span class="settings-value" id="rulesSummaryBadge">4 个词 · 生效中</span>
+        </summary>
+        <div class="settings-body">
+        <div class="chips" id="ruleChips"></div>
+        <div class="sel-bar rule-sel-bar" id="ruleSelBar" style="display:none;" data-tip="勾选 chip 左侧复选框可多选，再批量删除">
+          <span class="sel-count" id="ruleSelCount">已选 0 个词条</span>
+          <span class="spacer"></span>
+          <button type="button" class="mini" id="ruleSelAllBtn" data-tip="选中当前全部词条">全选</button>
+          <button type="button" class="mini" id="ruleSelNoneBtn" data-tip="取消所有已选词条">取消选择</button>
+          <button type="button" class="mini danger" id="ruleDelSelBtn" disabled data-tip="删除选中的敏感词">删除选中</button>
+        </div>
+        <div class="rule-add">
+          <textarea id="ruleInput" rows="2" placeholder="一行一个词，可直接粘贴多行" data-tip="输入要清除的词，一行一个；勾「正则」时按规律写" aria-label="添加敏感词"></textarea>
+          <select id="ruleType" aria-label="规则类型" data-tip="普通词：照字面找，最常用。正则：按规律找相似写法，适合会写的用户">
+            <option value="text">普通词</option>
+            <option value="regex">正则</option>
+          </select>
+          <button type="button" class="mini" id="addRuleBtn" data-tip="把输入框里的词加进词库">添加</button>
+        </div>
+        <div class="btn-row">
+            <button type="button" class="mini" id="loadPresetBtn" data-tip="用内部、秘密、机密、绝密恢复默认词库">载入默认词库</button>
+          <button type="button" class="mini" id="piiPresetBtn" data-tip="一键加入手机号、身份证号、银行卡号、邮箱、IP 地址的识别规则；已加过的自动跳过">个人信息模板…</button>
+          <span class="spacer"></span>
+          <div class="more" id="ruleMoreWrap">
+            <button type="button" class="mini" id="ruleMoreBtn" data-tip="整词匹配、排除前后缀、词库导入导出与清空" aria-expanded="false">更多 ▾</button>
+            <div class="more-pop" id="ruleMorePop" hidden>
+              <label class="opt-chk" data-tip="开启后英文 / 数字词只在整词边界命中，避免误伤长单词"><input type="checkbox" id="ruleWhole"><span>整词匹配</span></label>
+              <input type="text" id="ruleExcludeBefore" placeholder="排除前缀（可选），如 非" data-tip="命中词前面紧挨这些词时跳过，例如填「非」可保留「非内部」；多个用逗号分隔" aria-label="排除前缀">
+              <input type="text" id="ruleExcludeAfter" placeholder="排除后缀" data-tip="命中词后面紧挨这些词时跳过，多个用逗号分隔（防误伤）" aria-label="排除后缀">
+              <button type="button" class="mini" id="exportRuleBtn" data-tip="把当前词库保存为 JSON 文件">导出</button>
+              <button type="button" class="mini" id="importRuleBtn" data-tip="从 JSON 文件载入词库，追加到现有词条之后">导入</button>
+              <button type="button" class="mini danger" id="clearRuleBtn" data-tip="移除全部词条，文件列表不受影响">清空</button>
+            </div>
+          </div>
+          <input type="file" id="importRuleFile" accept=".json" hidden>
+        </div>
+        </div>
+      </details>
+
+      <details class="card settings-card" id="processCard">
+        <summary data-tip="怎么处理敏感词、处理好的文件放哪里；点这里展开后可修改">
+          <span class="settings-title">处理方式</span>
+          <span class="settings-value" id="processSummaryBadge">首行 + 尾行 · 删除</span>
+        </summary>
+        <div class="settings-body">
+        <!-- v3.5 场景预设：一次设好范围 / 命中后 / 输出 / 备份等全部选项 -->
+        <div class="preset-row" id="presetRow">
+          <label class="preset-lbl" for="presetSel" data-tip="按常见场景一次设好下面的处理规则与输出方式，选完仍可逐项微调">场景预设</label>
+          <select id="presetSel" aria-label="场景预设" data-tip="选一个场景，下面的范围 / 命中后 / 输出方式 / 备份等会自动设好">
+            <option value="">自定义（当前设置）</option>
+            <option value="internal">内部资料 · 只清首尾行</option>
+            <option value="secret">彻底清理 · 全文清除</option>
+            <option value="preview">先预览 · 只打码不删除</option>
+            <option value="handover">交付外发 · 写入新目录</option>
+            <option value="pii">个人信息 · 智能打码</option>
+          </select>
+        </div>
+        <div class="field">
+          <label id="scopeLabel" data-tip="清除哪些位置：默认只动首行和尾行，误伤风险最低">作用范围</label>
+          <div class="radio-group" role="radiogroup" aria-labelledby="scopeLabel">
+            <label data-tip="只清除文档首行和尾行里的密级标识"><input type="radio" name="scope" value="firstlast" checked><span>首行 + 尾行</span></label>
+            <label data-tip="只清除开头第一行 / 第一段，其余位置不动"><input type="radio" name="scope" value="first"><span>首行（首段）</span></label>
+            <label data-tip="清除全文所有命中；范围最广，请先预览再处理"><input type="radio" name="scope" value="all"><span>全文</span></label>
+          </div>
+        </div>
+        <div class="field">
+          <label id="actionLabel" data-tip="命中敏感词后：删掉、替换成掩码，还是换成你填的文本">命中后</label>
+          <div class="radio-group" role="radiogroup" aria-labelledby="actionLabel">
+            <label data-tip="直接把命中的敏感词删掉"><input type="radio" name="action" value="delete" checked><span>删除</span></label>
+            <label data-tip="号码类保留头尾（如 138****5678）、中文词整体打码；比固定 *** 更易核对"><input type="radio" name="action" value="mask"><span>智能打码</span></label>
+            <label data-tip="替换成下面输入框里填的文本"><input type="radio" name="action" value="custom"><span>自定义</span></label>
+          </div>
+          <div id="customWrap" style="margin-top:8px;display:none;">
+            <input type="text" id="customText" placeholder="自定义替换文本" data-tip="选了「自定义」后，命中的敏感词会替换成这里填的内容" aria-label="自定义替换文本">
+          </div>
+        </div>
+        <label class="switch" data-tip="删掉敏感词后，顺手把留下的多余空格和空行收拾干净"><input type="checkbox" id="tidySpace"> 清理替换后多余空格/空行</label>
+<label class="switch" data-tip="默认不区分大小写，Secret / SECRET / secret 都能命中。开启后只认完全一致的写法，用于英文缩写与编号类规则"><input type="checkbox" id="caseSensitive"> 区分大小写</label>
+        <div class="field" style="margin-top:12px;">
+          <label data-tip="一次并行处理几个文件；数值越大越快，也越占内存">同时处理文件数</label>
+          <input type="range" id="concurrency" min="1" max="16" value="4" style="width:100%;" data-tip="拖动调整并行数；越大越快，也越占内存" aria-label="同时处理文件数">
+          <span class="hint" id="concurrencyVal">4 个</span>
+        </div>
+        <div class="sub-head" id="outmodeHeading" data-tip="处理好的文件怎么交付：打包下载、写入新目录，或直接覆盖原文件">输出方式</div>
+        <div class="radio-group" role="radiogroup" aria-labelledby="outmodeHeading">
+          <label data-tip="处理结果打包成一个 ZIP 下载，原文件不动"><input type="radio" name="outmode" value="zip" checked><span>下载 ZIP</span></label>
+          <label data-tip="把处理结果写到你选的文件夹，保留原有目录结构"><input type="radio" name="outmode" value="newfolder"><span>保存到新目录</span></label>
+          <label data-tip="直接改写原文件；开启备份时会先留一份 .bak"><input type="radio" name="outmode" value="inplace"><span>覆盖原文件</span></label>
+        </div>
+        <button type="button" class="mini" id="pickOutDir" style="margin-top:10px;" data-tip="选「保存到新目录」时才用；选一次会记住">选择保存目录…</button>
+        <p class="warn-line" id="outDirWarn" hidden></p>
+        <label class="switch" data-tip="没被改动过的文件不进结果，减少无关文件"><input type="checkbox" id="onlyChanged" checked> 只输出已修改文件</label>
+        <label class="switch" data-tip="覆盖原文件前先另存一份 .bak，出错可还原"><input type="checkbox" id="backup" checked> 覆盖前备份原文件（.bak）</label>
+        <label class="switch" data-tip="脱敏成功后删掉 .bak 备份。备份里是含敏感词的原文，留着会被保密检查软件查到；删除后不能用「撤销」还原"><input type="checkbox" id="deleteBak"> 脱敏后删掉备份（对外交付用）</label>
+        <label class="switch" data-tip="按全文复查，首尾范围之外的残留也一并清除"><input type="checkbox" id="verifyAfter" checked> 首尾范围外也清干净</label>
+        </div>
+      </details>
+
+    </aside>
+
+    <!-- 右栏：文件与预览 -->
+    <section class="panel-column" id="fileWorkspace" data-task-stage="empty">
+      <ol class="flow-strip" aria-label="操作步骤">
+        <li class="flow-step is-current" id="flowAdd" aria-current="step" data-tip="先把要处理的文档加入列表，可多选，也可直接拖进来">
+          <span class="flow-num">1</span><span>添加文件</span>
+        </li>
+        <li class="flow-step" id="flowScan" data-tip="只读检查命中的词和位置，不修改文件">
+          <span class="flow-num">2</span><span>检查文件</span>
+        </li>
+        <li class="flow-step" id="flowRun" data-tip="按处理方式清除、导出或写回；完成后可导出记录">
+          <span class="flow-num">3</span><span>清除导出</span>
+        </li>
+      </ol>
+
+      <section class="task-summary" id="operationSummary" aria-labelledby="summaryTitle"
+        data-tip="这里汇总当前会清除哪些词、处理哪些位置、结果保存到哪里；改左侧设置后会自动更新">
+        <div class="task-summary-head">
+          <div>
+            <span class="task-eyebrow">本次操作</span>
+            <strong id="summaryTitle">先添加要处理的文档</strong>
+            <small id="summaryMeta">添加后可先检查，再决定是否清除</small>
+          </div>
+          <button type="button" class="mini" id="editTaskBtn" data-tip="跳到左侧修改敏感词和处理方式">调整</button>
+        </div>
+        <div class="task-summary-grid">
+          <div class="task-summary-item" data-tip="当前启用的敏感词会从文档中删除或替换">
+            <span>清除</span><strong id="summaryRules">4 个密级词</strong><small id="summaryRulesDetail">内部、秘密、机密、绝密</small>
+          </div>
+          <div class="task-summary-item" data-tip="说明处理范围和命中后的处理方式">
+            <span>处理</span><strong id="summaryProcess">首行 + 尾行 · 删除</strong><small id="summaryProcessDetail">先检查可避免误删</small>
+          </div>
+          <div class="task-summary-item" data-tip="说明处理结果保存位置以及原文件是否改变">
+            <span>输出</span><strong id="summaryOutput">下载 ZIP · 原文件不变</strong><small id="summaryOutputDetail">结果会另外打包</small>
+          </div>
+        </div>
+      </section>
+
+      <div id="dropzone" class="dropzone" role="button" tabindex="0" data-tip="把文档或整个文件夹拖到这里；也可点下方「添加文件」「添加文件夹」" aria-label="拖入文件或文件夹，也可用按钮选择">
+        <strong>把文档拖到这里</strong>
+        <span class="drop-sub" id="dropSub">也可以点下方「添加文件」或「添加文件夹」</span>
+      </div>
+
+      <div class="toolbar">
+        <button type="button" class="subtle" id="pickFilesBtn" data-tip="选择要处理的文档，可一次多选">添加文件</button>
+        <button type="button" class="subtle" id="pickDirBtn" data-tip="把文件夹里的文档一起加入（含子文件夹）">添加文件夹</button>
+        <span id="fileSummary">尚未添加文件</span>
+        <span class="spacer"></span>
+        <label class="switch inline" data-tip="只处理检查后确认有敏感词的文件"><input type="checkbox" id="onlyHit"> 只处理命中项</label>
+        <button type="button" class="ghost" id="scanBtn" data-tip="只读检查哪些文件、哪些位置有敏感词，不修改文件">检查文件</button>
+        <button type="button" class="ghost" id="clearBtn" data-tip="只清空列表，不删除磁盘上的文件">清空列表</button>
+        <!-- 导出记录是处理后的刚需出口（留档 / 审计），常驻工具条；JSON 留给程序用，放「更多」 -->
+        <button type="button" class="ghost" id="reportBtn" disabled data-tip="导出本次处理记录，可用 Excel 打开">导出记录</button>
+        <input type="text" id="reviewNote" placeholder="复核意见（可留空）" data-tip="人工复核结论，如「已复核，可外发」；会写进导出的报告，机器判定之外留一个签字的地方" aria-label="复核意见">
+        <button type="button" class="ghost" id="reportHtmlBtn" disabled data-tip="导出一张 A4 单页报告，可用浏览器打印成 PDF（给合规 / 审计）">导出 HTML</button>
+        <div class="more" id="moreWrap">
+          <button type="button" class="ghost" id="moreBtn" data-tip="添加多个位置、导出 JSON 等次要操作" aria-expanded="false">更多 ▾</button>
+          <div class="more-pop" id="morePop" hidden>
+            <button type="button" class="ghost" id="addDrivesBtn" data-tip="一次挑多个盘 / 目录，把里面的文档一起加入处理列表">添加多个位置…</button>
+            <button type="button" class="ghost" id="reportJsonBtn" disabled data-tip="导出本次处理记录（JSON）">导出 JSON</button>
+          </div>
+        </div>
+        <button type="button" class="primary" id="runBtn" disabled data-tip="请先添加文件；添加后可先检查，再清除并导出">清除并导出</button>
+        <button type="button" class="danger" id="stopRunBtn" hidden data-tip="停止处理：已完成的文件保留结果，未开始的不会处理">停止处理</button>
+        <!-- v3.4 一键撤销：仅在有原地覆盖记录时显示 -->
+        <button type="button" class="ghost" id="undoBtn" hidden data-tip="把上次处理的文件还原到处理前（取自同目录 .bak 备份）"></button>
+        <input type="file" id="fileInput" multiple hidden>
+        <input type="file" id="dirInput" webkitdirectory directory multiple hidden>
+      </div>
+
+      <div class="btn-row" id="addPickRow" style="display:none;padding:0 4px 10px;">
+        <span class="hint" id="addPickHint" style="margin:0;">已选 0 个位置</span>
+        <span class="spacer"></span>
+        <button type="button" class="mini" id="addPickAddBtn" data-tip="再选一个盘或文件夹加入列表">继续添加…</button>
+        <button type="button" class="mini danger" id="addPickClearBtn" data-tip="清空已选的位置，重新挑">清空</button>
+        <button type="button" class="primary" id="addPickStartBtn" disabled data-tip="把列表里所有位置的文件加入处理列表">加入列表</button>
+      </div>
+      <div class="filter-bar" id="fileFilterBar">
+        <input type="text" id="fileFilterQ" placeholder="筛选文件路径…" data-tip="按路径关键词筛选文件列表" aria-label="筛选文件路径">
+        <select id="fileFilterStatus" aria-label="按处理状态筛选" data-tip="按处理状态筛选文件列表">
+          <option value="all">全部状态</option>
+          <option value="hit">仅命中</option>
+          <option value="pending">未处理</option>
+          <option value="done">已处理</option>
+          <option value="error">失败或不支持</option>
+        </select>
+        <span class="hint" id="filterCount"></span>
+      </div>
+
+      <div class="sel-bar" id="selBar" style="display:none;" data-tip="勾选决定「清除并导出」处理哪些文件，一个都没勾则处理全部。Shift 连选整段 · Ctrl/⌘+A 全选 · Delete 移出列表">
+        <span class="sel-count" id="selCount">已选 0 个文件</span>
+        <span class="hint" id="selScopeHint"></span>
+        <span class="spacer"></span>
+        <button type="button" class="mini" id="selInvertBtn" data-tip="选中当前未选的行，取消已选的行">反选</button>
+        <button type="button" class="mini" id="selNoneBtn" data-tip="清空本页所有勾选（不会移除文件）">取消选择</button>
+        <button type="button" class="mini" id="delSelBtn" disabled data-tip="只从列表移除，不会删除磁盘文件">移出列表</button>
+      </div>
+
+      <div class="progress-wrap" hidden>
+        <div class="progress" role="progressbar" aria-label="处理进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progressBar"></div></div>
+        <span class="progress-text" id="progressText"></span>
+      </div>
+
+      <section class="card" id="scanResultCard" style="display:none;">
+        <h2 data-tip="文件夹扫描或导入报告后的命中清单，可勾选后一键处理">扫描结果</h2>
+        <p class="hint" id="scanMeta">点上方「扫描文件夹…」或「导入报告…」后，这里列出命中的文档。</p>
+        <div class="scan-live" id="scanLiveBar" hidden>
+          <span class="live-dot" data-tip="正在扫描中，点右侧可随时停止"></span>
+          <span id="scanLiveText" data-tip="扫描进行到哪里了：已查文件数与命中数实时更新">正在扫描…</span>
+          <span class="spacer"></span>
+          <button type="button" class="mini danger" id="scanLiveStopBtn" data-tip="立刻停止本次扫描，已扫出的结果保留">停止</button>
+        </div>
+        <p class="hint" id="netPathHint" hidden>网络盘（如 \\server\share）浏览器的目录选择器选不了，请用命令行 <code>node scan.mjs --dir "\\server\share" --json --report scan.json</code> 扫描，再点上方「导入报告…」选中 scan.json。</p>
+        <div class="btn-row">
+          <label class="switch inline" id="scanHideFpWrap" style="display:none;" data-tip="导入检查报告后复检 0 命中的「误报」行默认隐藏，取消勾选可查看全部条目">
+            <input type="checkbox" id="scanHideFp" checked> <span id="scanHideFpLabel">隐藏误报</span>
+          </label>
+          <button type="button" class="primary" id="scanCleanBtn" disabled data-tip="把选中的命中文档清理后写回原位置（默认先备份 .bak，可在「输出方式」中关闭）">一键处理选中</button>
+          <button type="button" class="primary" id="addScanToFiles" disabled data-tip="加入后会从结果中移出；导出报告仍保留全部命中">加入处理列表（0）</button>
+          <span class="spacer"></span>
+          <div class="more" id="scanMoreWrap">
+            <button type="button" class="ghost" id="scanMoreBtn" data-tip="反选、移出、重新甄别、检查残留、导出与关闭" aria-expanded="false">更多 ▾</button>
+            <div class="more-pop" id="scanMorePop" hidden>
+              <button type="button" class="ghost" id="scanSelInvert" data-tip="已选的取消，未选的选上">反选</button>
+              <button type="button" class="ghost" id="scanDelSelBtn" disabled data-tip="只从结果中移除，不会删除磁盘文件">移出结果</button>
+              <button type="button" class="ghost" id="scanRescreenBtn" disabled data-tip="改过词库或作用范围后，按新词库重新甄别已定位的报告文件">重新甄别</button>
+              <button type="button" class="ghost" id="scanVerifyBtn" disabled data-tip="只检查所选文件是否仍有敏感词，不会修改文件">检查残留</button>
+              <button type="button" class="ghost" id="scanReportBtn" disabled data-tip="导出本次命中清单，可用 Excel 打开">导出命中清单</button>
+              <button type="button" class="ghost" id="scanReportHtmlBtn" disabled data-tip="导出一张 A4 单页报告，可用浏览器打印成 PDF（给合规 / 审计）">导出 HTML</button>
+              <button type="button" class="ghost" id="scanReportJsonBtn" disabled data-tip="导出本次命中清单（JSON）">导出 JSON</button>
+              <button type="button" class="ghost" id="closeScanCard" data-tip="收起扫描结果表，结果仍保留">关闭</button>
+            </div>
+          </div>
+          <button type="button" class="danger" id="scanDelDiskBtn" disabled data-tip="永久删除所选文件，无法恢复">从磁盘删除</button>
+        </div>
+                <div class="btn-row" id="scanReviewRow" style="display:none;margin-top:8px;">
+          <input type="text" id="scanReviewNote" placeholder="扫描复核意见（可留空）" data-tip="对本次扫描结论的人工判断，如「已确认 3 个需处理、其余为误报」；与处理阶段的复核意见分开记录，写进扫描报告" aria-label="扫描复核意见">
+          <button type="button" class="ghost" id="reviewListBtn" data-tip="展开结构化复核清单，逐项勾选后写进报告" aria-expanded="false">复核清单 ▾</button>
+        </div>
+        <div id="reviewListPanel" hidden>
+          <p class="hint" data-tip="参照保密检查系统的人工判定项整理；逐项勾选后，结论随扫描报告一起导出">逐项确认下列情况，作为机器判定之外的人工结论：</p>
+          <ul class="review-list" id="reviewList"></ul>
+          <div class="btn-row">
+            <span class="hint" id="reviewListStat">尚未勾选</span>
+            <button type="button" class="ghost" id="reviewListReset" data-tip="清空本页所有勾选，重新开始">重置勾选</button>
+          </div>
+        </div>
+        <div class="filter-bar" id="scanFilterRow">
+          <input type="text" id="scanFilterQ" placeholder="筛选路径或命中词…" data-tip="按路径或命中词筛选扫描结果" aria-label="筛选路径或命中词">
+          <select id="scanFilterStatus" aria-label="按扫描状态筛选" data-tip="按处理状态筛选">
+            <option value="all">全部状态</option>
+            <option value="hit">仅看命中</option>
+            <option value="fp">仅看误报</option>
+            <option value="unchecked">未检查</option>
+          </select>
+          <select id="scanSort" aria-label="扫描结果排序方式" data-tip="排序方式">
+            <option value="default">默认顺序</option>
+            <option value="hits">命中多→少</option>
+            <option value="size">大小↓</option>
+            <option value="path">路径 A→Z</option>
+          </select>
+          <span class="hint" id="scanFilterCount" style="margin:0;"></span>
+        </div>
+        <p class="scan-tally" id="scanTally" data-tip="本次扫描的合计：命中数、误报数和未检查数，点击可只看对应类别" role="status"></p>
+        <p class="hint">点行预览；<code>Ctrl+Enter</code> 处理，<code>Esc</code> 收起；「从磁盘删除」不可恢复。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col" class="sel-col" data-tip="全选 / 取消全选下方所有命中行"><input type="checkbox" id="scanSelAllBox" data-tip="全选 / 取消全选" aria-label="全选 / 取消全选"></th>
+                <th scope="col" style="width:42%" data-tip="文件在磁盘上的完整路径">路径</th>
+                <th scope="col" data-tip="文档格式">类型</th>
+                <th scope="col" data-tip="命中字数占全文有效字数的比例，回答这份文件有多涉密">占比</th>
+                <th scope="col" data-tip="扫描发现的敏感词处数">命中</th>
+                <th scope="col" data-tip="命中的具体词语；点其中一个词可选中所有命中它的行">命中词</th>
+                <th scope="col" style="width:80px" data-tip="对该行的操作">操作</th>
+              </tr>
+            </thead>
+            <tbody id="scanBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="table-wrap table-files" id="fileTablePanel">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col" class="sel-col" data-tip="全选 / 取消全选当前筛选出的文件"><input type="checkbox" id="fileSelAll" data-tip="全选 / 取消全选（仅当前筛选结果）" aria-label="全选 / 取消全选（仅当前筛选结果）"></th>
+              <th scope="col" style="width:40%" data-tip="文件在磁盘上的完整路径">路径</th>
+              <th scope="col" data-tip="文档格式">类型</th>
+              <th scope="col" data-tip="文件大小">大小</th>
+              <th scope="col" data-tip="扫描发现的敏感词处数">命中</th>
+              <th scope="col" data-tip="待处理 / 命中 / 无敏感词 / 已处理 / 错误">状态</th>
+              <th scope="col" style="width:44px" data-tip="对该行的操作">操作</th>
+            </tr>
+          </thead>
+          <tbody id="fileBody"></tbody>
+        </table>
+        <div class="empty" id="emptyHint">
+          <svg class="empty-art" viewBox="0 0 120 96" aria-hidden="true" focusable="false">
+            <rect x="26" y="12" width="52" height="66" rx="7" fill="var(--empty-doc)"/>
+            <path d="M26 12h34l18 18v48H26z" fill="var(--empty-doc)"/>
+            <path d="M60 12l18 18H60z" fill="var(--empty-fold)"/>
+            <rect x="35" y="42" width="30" height="5" rx="2.5" fill="var(--empty-line)"/>
+            <rect x="35" y="54" width="20" height="5" rx="2.5" fill="var(--empty-line)"/>
+            <rect x="35" y="66" width="25" height="5" rx="2.5" fill="var(--empty-line)"/>
+            <circle cx="88" cy="62" r="20" fill="var(--empty-dot)"/>
+            <path d="m78 62 7 7 14-16" fill="none" stroke="#fff" stroke-width="5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <p class="empty-title" id="emptyTitle">还没有文档</p>
+          <p class="empty-sub" id="emptySub">把文件拖到这里，或点上方按钮选择</p>
+        </div>
+      </div>
+
+      <section class="card" id="previewCard">
+        <h2>文件预览 <span class="preview-name" id="previewName"></span><span class="hit-words" id="previewHits"></span><span class="spacer"></span><button type="button" class="mini" id="copyResultBtn" disabled data-tip="把处理后的文本复制到剪贴板">复制结果</button></h2>
+        <p class="preview-note" id="previewNote" role="status" hidden></p>
+        <div class="preview-body">
+          <div class="preview-col">
+            <h3 data-tip="处理前的原文，命中的敏感词用高亮标出">原文（命中高亮）</h3>
+            <pre class="preview-text" id="previewOrig">在文件列表点一行，这里显示原文与命中位置。</pre>
+          </div>
+          <div class="preview-col">
+            <h3 data-tip="按当前设置处理后的文本，可与左侧对照">处理后</h3>
+            <pre class="preview-text" id="previewNew"></pre>
+          </div>
+        </div>
+      </section>
+
+      <details class="card log-card" id="logCard">
+        <summary data-tip="展开查看每个文件的结果和失败原因；出错时会自动展开">
+          <span>处理日志</span>
+          <span class="log-summary-hint">出错时自动展开</span>
+        </summary>
+        <div class="log-tools">
+          <button type="button" class="mini" id="clearLogBtn" data-tip="只清屏；历史处理记录仍可用「导出记录」保存">清空日志</button>
+        </div>
+        <div class="log" id="log" role="log" aria-live="polite" aria-label="处理日志"></div>
+      </details>
+    </section>
+  </main>
+
+  <footer class="app-foot">
+    <span>纯本地运行，数据不出本机 · michaelqiu 出品</span>
+    <span class="dot">·</span>
+    <span id="footVer">Doc-Internal-Word-Remover</span>
+  </footer>
+
+  <!-- 引擎按依赖顺序加载 -->
+  <script src="js/zip.js"></script>
+  <script src="js/rules.js"></script>
+  <script src="js/ooxml.js"></script>
+  <script src="js/util.js"></script>
+  <script src="js/report.js"></script>
+  <script src="js/format.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/dircache.js"></script>
+  <script src="js/undo.js"></script>
+  <script src="js/reporthtml.js"></script>
+  <script src="js/app.js"></script>
+</body>
+
+</html>

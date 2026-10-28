@@ -1,0 +1,17 @@
+{
+  "name": "文档敏感词批量清除工具",
+  "short_name": "敏感词清除",
+  "description": "纯本地运行的文档敏感词批量清除工具：Word / Excel / PPT 与文本文件，数据不出本机。",
+  "lang": "zh-CN",
+  "author": "michaelqiu",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f5f7",
+  "theme_color": "#0066cc",
+  "icons": [
+    { "src": "assets/app-icon.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" },
+    { "src": "assets/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "assets/app-icon.ico", "sizes": "any", "type": "image/x-icon" }
+  ]
+}

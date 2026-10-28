@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    name: Node tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Go tests (launcher)
+        run: cd tools/launcher && go test ./...
+      - name: Run regression tests
+        run: |
+          node test-allparts.mjs
+          node test-roundtrip.mjs
+          node test-coverage.mjs
+          node test-concurrency.mjs
+          node test-report.mjs
+          node test-formats.mjs
+          node test-rules.mjs
+          node test-security.mjs
+          node test-app.mjs
+          node tools/check-public.mjs
