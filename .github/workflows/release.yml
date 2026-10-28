@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-sync
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -13,6 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23'
@@ -79,7 +86,7 @@ jobs:
             echo "- 命令行按报告脱敏：node scan.mjs --from-report <报告.html|json|txt> --authorized-root <授权目录> --out cleaned。"
             echo ""
             echo "### 质量"
-            echo "本版本已通过 9 个零依赖回归测试套件（\`test-allparts\` / \`test-roundtrip\` / \`test-coverage\` / \`test-concurrency\` / \`test-report\` / \`test-formats\` / \`test-rules\` / \`test-security\` / \`test-app\`）。"
+            echo "本版本已通过 10 个零依赖回归测试套件（\`test-allparts\` / \`test-roundtrip\` / \`test-coverage\` / \`test-concurrency\` / \`test-report\` / \`test-formats\` / \`test-rules\` / \`test-security\` / \`test-app\` / \`test-release-sync\`）。"
           } > notes.md
 
       - name: Guard empty release notes section
@@ -96,3 +103,9 @@ jobs:
           body_path: notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync release to Gitee
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: node tools/release-sync.mjs --tag "$GITHUB_REF_NAME"

@@ -1,0 +1,48 @@
+name: Release sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '只同步指定版本；留空则核对全部'
+        required: false
+        type: string
+      dry_run:
+        description: '只检查，不写入'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '17,47 * * * *'
+
+concurrency:
+  group: release-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Reconcile GitHub and Gitee releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          SYNC_TAG: ${{ inputs.tag }}
+          SYNC_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [ -n "$SYNC_TAG" ]; then
+            args+=(--tag "$SYNC_TAG")
+          fi
+          if [ "$SYNC_DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          node tools/release-sync.mjs "${args[@]}"

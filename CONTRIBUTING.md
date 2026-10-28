@@ -10,7 +10,7 @@
 4. **所有改动先跑测试**：
 
    ```bash
-   npm test          # 9 套引擎/UI/安全回归，任一失败不可合并
+   npm test          # 10 套引擎/UI/安全/发布回归，任一失败不可合并
    ```
 
    若改 `js/app.js` 同时要跑 Playwright 浏览器冒烟：`BASE_URL=http://127.0.0.1:8091/index.html node test-e2e.mjs`。
@@ -25,6 +25,18 @@
 - `fix(ui): UI 打磨与便捷性修复（v1.7.0）`
 
 类型：`feat` / `fix` / `perf` / `refactor` / `docs` / `test` / `chore`。
+
+## Release 同步
+
+GitHub 与 Gitee 的 Release 由 `tools/release-sync.mjs` 双向核对。标签发布后会自动同步；定时任务每 30 分钟补齐任一平台缺少的版本或项目 ZIP。两个平台都存在时，只核对正文和附件 SHA256，不覆盖已有附件。
+
+仓库需要配置 `GITEE_TOKEN` Secret。手动核对全部版本：
+
+```bash
+GITHUB_TOKEN=... GITEE_TOKEN=... node tools/release-sync.mjs
+```
+
+先在 Actions 中运行一次 `Release sync`，勾选 `dry_run`，可以只检查而不写入。
 
 ## 新增功能
 

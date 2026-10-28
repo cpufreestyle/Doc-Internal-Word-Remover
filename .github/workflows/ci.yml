@@ -30,4 +30,5 @@ jobs:
           node test-rules.mjs
           node test-security.mjs
           node test-app.mjs
+          node test-release-sync.mjs
           node tools/check-public.mjs
