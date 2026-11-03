@@ -19,7 +19,7 @@ const BASE = process.env.BASE_URL || 'http://localhost:8080/index.html';
 
 /** 在 Node 侧加载与浏览器端完全相同的 zip / rules / ooxml 引擎 */
 function loadEngine() {
-  const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js'];
+  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js'];
   const code = files.map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
   const ctx = {
     TextEncoder, TextDecoder,

@@ -138,6 +138,18 @@
   var EXCEL_EXT = ['xlsx', 'xlsm', 'xltx', 'xltm'];
   var PPT_EXT = ['pptx', 'pptm', 'potx', 'potm', 'ppsx', 'ppsm'];
   var OFFICE_EXT = WORD_EXT.concat(EXCEL_EXT, PPT_EXT);
+  // 旧版 OLE2 复合文档：只能只读检测，不能原地清除（改内容需要重写复合文档结构）。
+  // 单独标识，避免被误加进「处理列表」后写坏原文件。
+  var LEGACY_EXT = ['doc', 'xls', 'ppt', 'dot', 'xlt', 'pot'];
+  // RTF：纯文本容器，但中文以 \'hh / \uN 转义存放，按普通文本解码读不到词。
+  // 与旧版 Office 同档：能只读检测，不做原地清除（改写要重新转义，风险大于收益）。
+  var RTF_EXT = ['rtf'];
+  // PDF：正文需要解压 + CMap 还原（js/pdf.js）；同样只能只读检测——
+  // 重写 PDF 要重建 xref / 对象图，风险远大于收益。
+  var PDF_EXT = ['pdf'];
+  // 压缩包：外部检查软件会解包后检索，所以这里也解开逐条查。
+  // 只能只读检测（改包内文件要重打包，且会破坏签名），命中后提示人工处理。
+  var ARCHIVE_EXT = ['zip', 'zipx', 'jar', 'apk', 'xpi', 'epub', 'whl', 'nupkg'];
 
   function extOf(name) {
     var i = String(name).lastIndexOf('.');
@@ -147,7 +159,8 @@
   /* v4.3 主流格式：默认扫描范围。日常办公文档一档，
      不含源码 / 配置 / 构建产物（命中率低且显著拖慢整盘扫描）。
      用户可在界面增删，或切回「全部支持格式」。 */
-  var COMMON_EXT = ['docx', 'xlsx', 'pptx', 'txt', 'md', 'csv', 'rtf', 'docm', 'xlsm', 'pptm'];
+  // 含旧版 doc/xls/ppt：默认扫描范围应当覆盖老文档（只读检测，避免「没扫到 = 干净」的错觉）
+  var COMMON_EXT = ['docx', 'xlsx', 'pptx', 'pdf', 'doc', 'xls', 'ppt', 'txt', 'md', 'csv', 'rtf', 'docm', 'xlsm', 'pptm', 'zip'];
 
   /** 当前生效的扩展名过滤器：null 表示不限制（全部支持格式） */
   var extFilter = null;
@@ -163,9 +176,31 @@
 
   function isTextFile(name) { return TEXT_EXT.indexOf(extOf(name)) >= 0; }
   function isOfficeFile(name) { return OFFICE_EXT.indexOf(extOf(name)) >= 0; }
+  function isLegacyOfficeFile(name) { return LEGACY_EXT.indexOf(extOf(name)) >= 0; }
+  function isRtfFile(name) { return RTF_EXT.indexOf(extOf(name)) >= 0; }
+  function isPdfFile(name) { return PDF_EXT.indexOf(extOf(name)) >= 0; }
+  function isArchiveFile(name) { return ARCHIVE_EXT.indexOf(extOf(name)) >= 0; }
+  /** 按真实签名判定 PDF（扩展名会骗人：.doc 里装 PDF 也常见） */
+  function isPdfBytes(bytes) {
+    return !!bytes && bytes.length > 4
+      && bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 && bytes[4] === 0x2d;
+  }
   function isSupported(name) {
     if (extFilter && extFilter.indexOf(extOf(name)) < 0) return false;
     return isTextFile(name) || isOfficeFile(name);
+  }
+  /** 可只读检测（含旧版 Office）；仍受当前扩展名过滤器约束 */
+  function isDetectOnly(name) {
+    if (!isLegacyOfficeFile(name) && !isRtfFile(name) && !isPdfFile(name) && !isArchiveFile(name)) return false;
+    return !extFilter || extFilter.indexOf(extOf(name)) >= 0;
+  }
+  /**
+   * 能否「只读检测」（不受扩展名过滤器约束）：旧版 Office 与 RTF。
+   * 两者都能检出敏感词，但都不能原地清除，所以扫描要读、处理要跳过。
+   * 调用点用它代替 isLegacyOfficeFile，避免漏掉 RTF。
+   */
+  function isDetectableOnly(name) {
+    return isLegacyOfficeFile(name) || isRtfFile(name) || isPdfFile(name) || isArchiveFile(name);
   }
 
   /** 归类：'doc' | 'xls' | 'ppt' | 'txt'（供界面标签与报告统一使用） */
@@ -893,6 +928,13 @@
           out = replaceBlocks(out, b.re, b.tag, engine, counter, !!(spec.full || b.full), g.range);
         });
       });
+      // 命名空间前缀容错：部件写成 <x:c><x:v> 这类「带前缀」形态时，块正则按 <si> / <v>
+      // 等无前缀标签写死会一条都匹配不上，整个部件静默漏检——外部检查软件解包直读却能检出。
+      // （实测 Google / 豆包导出的 xlsx 用 x: 前缀，正文密级标识扫描报 0 命中。）
+      // 退回「标签之间的文本节点」口径：它按 >…< 取文本，与前缀无关，且一个标签都不改写。
+      if (!spec.textnodes && !anyBlockMatches(work, allBlocks)) {
+        out = replaceTextNodes(out, engine, counter, spec.full);
+      }
     }
     // 元数据类部件（文档属性 / 工作表名 / 表名等）整部件处理；
     // 属性值（形状名、替换文字、书签名、域指令等）同样属于元数据，一律不跟随用户选择的首尾范围
@@ -900,6 +942,17 @@
     if (spec.attrs) out = replaceAttrs(out, engine, counter, spec.full || spec.attrsFull);
     if (levels) out = unmaskNestedWord(out);
     return out;
+  }
+
+  /** 任一块正则在部件里匹配到了内容？没有就说明这份 XML 的标签写法不在策略覆盖范围内。
+   *  非全局正则的 test 命中即停，常规文档第一组就返回，开销可忽略。 */
+  function anyBlockMatches(xml, blocks) {
+    for (var i = 0; i < blocks.length; i++) {
+      try {
+        if (new RegExp(blocks[i].re.source).test(xml)) return true;
+      } catch (e) { /* 非法正则按未匹配处理 */ }
+    }
+    return false;
   }
 
   /* ---------------- 结构层加固：条目名 / 引用 / 缩略图 ---------------- */
@@ -1225,7 +1278,7 @@
     budget = budget || officeBudget(arrayBuffer.byteLength);
     depth = depth || 0;
     return Zip.load(arrayBuffer).then(function (zip) {
-      var counter = { hits: 0, hitChars: 0, totalChars: 0, matched: [], firstHit: false, lastHit: false, hasVba: false, hasThumb: false };
+      var counter = { hits: 0, hitChars: 0, totalChars: 0, matched: [], parts: [], firstHit: false, lastHit: false, hasVba: false, hasThumb: false };
       var ne = noopEngine(engine);
       var tasks = [];
 
@@ -1238,6 +1291,7 @@
           (nr.matched || []).forEach(function (m) {
             if (counter.matched.indexOf(m) < 0) counter.matched.push(m);
           });
+          notePartHit(counter, entry.name, nr.hits, nr.matched);
         }
         if (/vbaProject\.bin$/i.test(entry.name)) counter.hasVba = true;
         if (THUMB_RE.test(entry.name)) counter.hasThumb = true;
@@ -1245,7 +1299,7 @@
         if (spec) {
           tasks.push(zip.getText(entry.name).then(function (xml) {
             if (xml == null) return;
-            processXml(xml, ne, spec, counter);
+            processXml(xml, partEngine(engine, counter, entry.name), spec, counter);
           }));
           return;
         }
@@ -1261,6 +1315,8 @@
               r.matched.forEach(function (m) {
                 if (counter.matched.indexOf(m) === -1) counter.matched.push(m);
               });
+              // 内嵌文档整体算一个部位：路径本身就说明「藏在哪个对象里」
+              notePartHit(counter, entry.name, r.hits, r.matched);
               if (r.hits > 0) {
                 if (r.firstHit) counter.firstHit = true;
                 if (r.lastHit) counter.lastHit = true;
@@ -1273,7 +1329,7 @@
       });
 
       return Promise.all(tasks).then(function () {
-        return { hits: counter.hits, hitChars: counter.hitChars, totalChars: counter.totalChars, ratio: counter.totalChars > 0 ? counter.hitChars / counter.totalChars : 0, matched: counter.matched, firstHit: !!counter.firstHit, lastHit: !!counter.lastHit, vba: !!counter.hasVba, thumb: !!counter.hasThumb };
+        return { hits: counter.hits, hitChars: counter.hitChars, totalChars: counter.totalChars, ratio: counter.totalChars > 0 ? counter.hitChars / counter.totalChars : 0, matched: counter.matched, parts: counter.parts, firstHit: !!counter.firstHit, lastHit: !!counter.lastHit, vba: !!counter.hasVba, thumb: !!counter.hasThumb };
       });
     });
   }
@@ -1363,7 +1419,9 @@
         }
       });
     }
-    if (spec.textnodes) {
+    // 与 processXml 同一容错：块正则一条都没匹配上（命名空间前缀写法）时按文本节点抽取，
+    // 否则扫描报了命中、预览里却一个字都看不到
+    if (spec.textnodes || (allBlocks.length && !anyBlockMatches(xml, allBlocks))) {
       var tn = />([^<>]+)</g, x;
       while ((x = tn.exec(xml)) !== null) {
         var d = decodeXml(x[1]);
@@ -1385,6 +1443,7 @@
    */
   function partLabel(name) {
     var n = String(name).toLowerCase();
+    if (/embeddings\//.test(n)) return '内嵌文档';
     if (/^word\//.test(n)) {
       if (/^word\/document\.xml$/.test(n)) return '正文';
       if (/^word\/header/.test(n)) return '页眉';
@@ -1499,29 +1558,139 @@
     return views;
   }
 
-  /** 旧版 OLE 容器（doc / xls）里的文本按 UTF-16LE 存放，按 UTF-16 解码后即可检索 */
-  function utf16leText(bytes) {
-    var out = '';
-    var end = bytes.length - (bytes.length % 2);
-    for (var i = 0; i < end; i += 2) {
-      var c = bytes[i] | (bytes[i + 1] << 8);
-      out += (c >= 32 && c !== 0xffff) ? String.fromCharCode(c) : ' ';
+  /**
+   * UTF-16LE 的两个字节对齐视角。
+   * OLE2 复合文档里字符串以「字节流」散布在扇区中，起始偏移并不保证 2 字节对齐：
+   * 记录头 / 填充字节会让正文整体右移 1 字节，于是偶数对齐解出来全是噪声。
+   * 实测语料里有 .ppt 只有奇数对齐才能解出密级标识（内部:3、秘密:9），
+   * 而按偶数对齐检测的结论是「干净」——外部检查软件却能检出，属于漏报。
+   * 两路都解一遍：多出的那份视图只会提高检出，不会引入误报（词本身仍需在字节里成对出现）。
+   */
+  function utf16leViews(bytes) {
+    var views = [];
+    for (var off = 0; off <= 1; off++) {
+      var out = '';
+      for (var i = off; i + 1 < bytes.length; i += 2) {
+        var c = bytes[i] | (bytes[i + 1] << 8);
+        out += (c >= 32 && c !== 0xffff) ? String.fromCharCode(c) : ' ';
+      }
+      views.push(out);
     }
+    return views;
+  }
+
+  /**
+   * RTF 文本抽取。
+   * RTF 里的中文不可能是裸 UTF-8：Word / WPS 存成 \'hh（ANSI 十六进制转义，代码页多为 cp936），
+   * 有的写手存成 \uN?（十进制码点）。按普通文本解码得到的是「\\'BB\\'FA」这种转义串，
+   * 敏感词一个都读不到——外部检查软件却能检出，表现为「我们报干净、它报命中」（实测语料确认）。
+   * 只取正文：{\* ...} 是注释性目标、\pict 内是图片十六进制，二者不参与解码以免把二进制噪声当文字。
+   * @returns {string} 解码后的可检索文本
+   */
+  function rtfText(bytes) {
+    var latin = new TextDecoder('latin1').decode(bytes);
+    var cp = /\\ansicpg(\d{3,5})/.exec(latin);
+    var encoding = cp ? 'cp' + cp[1] : 'gbk';
+    var dec;
+    // 浏览器 / Node 对非 UTF-8 编码的支持不一致（缺 gbk 时退到 latin1：
+    // \uN 写法的词仍能读到，只是 \'hh 的中文读不出，不至于整份文件报「读取失败」）
+    try { dec = new TextDecoder(encoding, { fatal: false }); }
+    catch (e) {
+      try { dec = new TextDecoder('gbk', { fatal: false }); }
+      catch (e2) { dec = new TextDecoder('latin1', { fatal: false }); }
+    }
+
+    var out = '';
+    var pending = [];    // 连续 \'hh 的字节，凑成一组再解码（单个字节不是合法 GBK 字符）
+    var i = 0;
+    var n = latin.length;
+    function flush() {
+      if (!pending.length) return;
+      out += dec.decode(Uint8Array.from(pending));
+      pending = [];
+    }
+    while (i < n) {
+      var ch = latin.charAt(i);
+      if (ch !== '\\') {
+        if (ch !== '{' && ch !== '}' && ch !== '\r' && ch !== '\n') { flush(); out += ch; }
+        i++;
+        continue;
+      }
+      if (latin.substr(i, 2) === "\\'") {
+        var hx = latin.substr(i + 2, 2);
+        if (/^[0-9a-fA-F]{2}$/.test(hx)) { pending.push(parseInt(hx, 16)); i += 4; continue; }
+        i += 2; continue;
+      }
+      var word = /^\\([a-zA-Z]+)(-?\d{1,10})? ?/.exec(latin.slice(i, i + 24));
+      if (!word) { i++; continue; }
+      var name = word[1], num = word[2];
+      // \uN 是 Unicode 码点（负数按补码取低 16 位），后面常跟一个替代字符，丢弃即可
+      if (name === 'u' && num != null) {
+        flush();
+        out += String.fromCharCode(parseInt(num, 10) & 0xffff);
+        i += word[0].length;
+        continue;
+      }
+      if (name === 'par' || name === 'line' || name === 'tab' || name === 'cell' || name === 'row') {
+        flush();
+        out += '\n';
+      }
+      i += word[0].length;
+    }
+    flush();
     return out;
   }
 
-  var VIEW_KIND_LABEL = { text: '', attr: '·属性', hide: '·注释', utf16: '·OLE', bin: '·二进制', name: '·条目名' };
+  /** 按内容判定是否 RTF：扩展名会骗人（实测有 .doc 实际是 RTF），头部特征才可信 */
+  function looksLikeRtf(bytes) {
+    if (!bytes || bytes.length < 8) return false;
+    if (bytes[0] !== 0x7b) return false; // '{'
+    var head = new TextDecoder('latin1').decode(bytes.subarray(0, 32));
+    return /^\{\s*\\rtf[0-9\s]/.test(head);
+  }
+
+  /* utf16 / utf16alt：OLE2 里 UTF-16LE 的两种字节对齐（偶数位 / 奇数位）。
+     标出来是为了让用户知道词是「按错位解出来的」，人工复核时能对应上。 */
+  var VIEW_KIND_LABEL = { text: '', attr: '·属性', hide: '·注释', utf16: '·OLE', utf16alt: '·OLE错位', rtf: '·RTF', pdf: '·PDF正文', bin: '·二进制', name: '·条目名' };
+
+  /** PDF 正文视图；读不出（加密 / 扫描件 / 损坏）返回 null，由调用方降级 */
+  function pdfViews(bytes) {
+    var P = global.DWRPdf;
+    if (!P || typeof P.extract !== 'function') return null;
+    try {
+      var r = P.extract(bytes);
+      if (!r) return null;
+      if (!r.text) return null;
+      return [{ kind: 'pdf', text: r.text }];
+    } catch (e) {
+      return null;
+    }
+  }
 
   function viewsFor(name, bytes) {
     var n = String(name).toLowerCase();
     if (/\.(?:xml|rels)$/.test(n)) return xmlViews(new TextDecoder('utf-8').decode(bytes));
     if (isTextFile(n)) return [{ kind: 'text', text: decodeText(bytes).text }];
-    // OLE2 复合文档签名 D0CF11E0：旧版 Office / 嵌入对象的文本按 UTF-16 存放
-    if (bytes.length > 8 && bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0) {
-      return [{ kind: 'utf16', text: utf16leText(bytes) }];
+    // 按真实签名分支，扩展名只作补充：改名 / 后缀与内容不符是常态（实测 .doc 装 RTF、.rtf 装 OLE2）
+    var ole2 = bytes.length > 8 && bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0;
+    if (ole2) {
+      // OLE2 里的文本按 UTF-16 存放；两种字节对齐都要看（字符串不保证 2 字节对齐）
+      var vs = utf16leViews(bytes);
+      return [{ kind: 'utf16', text: vs[0] }, { kind: 'utf16alt', text: vs[1] }];
+    }
+    // PDF：正文压在里面，要解压 + 按 CMap 还原。签名优先，改名成 .doc 的也能读。
+    if (isPdfBytes(bytes) || isPdfFile(n)) {
+      var pv = pdfViews(bytes);
+      if (pv) return pv;
+    }
+    // RTF 的中文是 \'hh / \uN 转义，按普通文本解码读不到词
+    if (looksLikeRtf(bytes) || isRtfFile(n)) {
+      var t = rtfText(bytes);
+      if (t) return [{ kind: 'rtf', text: t }];
     }
     return [{ kind: 'bin', text: new TextDecoder('utf-8').decode(bytes) }];
   }
+
   function addVerifyHit(res, label, hits, matched) {
     res.hits += hits;
     matched.forEach(function (m) { if (res.matched.indexOf(m) < 0) res.matched.push(m); });
@@ -1532,6 +1701,38 @@
     if (!p) { p = { name: label, hits: 0, matched: [] }; res.parts.push(p); }
     p.hits += hits;
     matched.forEach(function (m) { if (p.matched.indexOf(m) < 0) p.matched.push(m); });
+    if (!p.label) p.label = partLabel(p.name);
+  }
+
+  /** 部位命中记录：{ name, label, hits, matched }
+   *   name 是包内真实路径，label 是给人看的中文部位名。
+   *   没有它，用户只看到「命中 3 处：内部」，翻遍正文也找不到——密级标识常常写在
+   *   备注页 / 图表 / 文档属性 / 形状名里，正文里根本不可见（v4.80）。 */
+  function notePartHit(counter, name, hits, matched) {
+    if (!counter || !counter.parts || !(hits > 0)) return;
+    var p = null;
+    for (var i = 0; i < counter.parts.length; i++) {
+      if (counter.parts[i].name === name) { p = counter.parts[i]; break; }
+    }
+    if (!p) {
+      p = { name: name, label: partLabel(name), hits: 0, matched: [] };
+      counter.parts.push(p);
+    }
+    p.hits += hits;
+    (matched || []).forEach(function (m) { if (p.matched.indexOf(m) < 0) p.matched.push(m); });
+  }
+
+  /** 包一层引擎：apply 真的改动了文本时，把「哪个部件、哪个词、几处」记进 counter.parts。
+   *  与 mergeMatch 的调用条件保持一致（只在文本变化时计数），两边不会重复也不会漏。 */
+  function partEngine(engine, counter, name) {
+    return {
+      apply: function (text, isFirst, isLast) {
+        var res = engine.apply(text, isFirst, isLast);
+        if (res && res.text !== text && res.hits > 0) notePartHit(counter, name, res.hits, res.matched);
+        return res;
+      },
+      scan: function (text, isFirst, isLast) { return engine.scan(text, isFirst, isLast); }
+    };
   }
 
   function scanViews(views, engine, label, res) {
@@ -1561,8 +1762,10 @@
       scanViews([{ kind: 'name', text: entry.name }], engine, prefix + entry.name, res);
       return zip.getBytes(entry.name).then(function (bytes) {
         if (!bytes || !bytes.length) return;
-        // 内嵌 Office 文档：内容同样是外部检查工具的检索对象，递归复检
-        if (/embeddings\//.test(entry.name) && isOfficeFile(entry.name)) {
+        // 条目本身又是一个 ZIP（内嵌 Office / 压缩包里套的文档）：内容同样是
+        // 外部检查工具的检索对象，按预算递归解开。只看 embeddings/ 路径会漏掉
+        // 普通压缩包里直接放的 docx / xlsx / pptx。
+        if (bytes.length > 1 && bytes[0] === 0x50 && bytes[1] === 0x4b) {
           assertNestedBudget(budget, bytes.byteLength, depth);
           var ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
           return Zip.load(ab).then(function (inner) {
@@ -1608,12 +1811,68 @@
       return res;
     });
   }
+
+  /**
+   * 只读检测任意文件字节（不改内容）：按真实文件名选择解码方式。
+   * 旧版 .doc/.xls/.ppt 走 OLE2 分支（UTF-16LE 文本），改名成 .docx 的 ZIP 走全包复检。
+   * @param {string} name 文件名（决定解码分支，必须传真实扩展名）
+   * @param {Uint8Array} bytes
+   * @returns {Promise<{hits:number, matched:string[], parts:Array}>}
+   */
+  function scanBytes(name, bytes, engine) {
+    if (!bytes || !bytes.length) return Promise.resolve({ hits: 0, matched: [], parts: [] });
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b) return verifyBytes(bytes, engine);
+    return Promise.resolve().then(function () {
+      var res = { hits: 0, matched: [], parts: [] };
+      // 旧版二进制没有「部件」概念，部位名带上文件名，至少告诉用户词就在这个文件里
+      var base = String(name || '').replace(/^.*[\\/]/, '');
+      scanViews(viewsFor(name, bytes), engine, base, res);
+      // 扫描件 PDF：解不出文本层，不计入正文命中，由调用方按「仅文件名 + 需人工复核」处理
+      if (isPdfFile(name) || isPdfBytes(bytes)) {
+        var P = global.DWRPdf;
+        if (P && typeof P.extract === 'function') {
+          var er = P.extract(bytes);
+          if (er && er.imageOnly) {
+            res.imageOnly = true;
+            res.unreadReason = '扫描件 PDF，无可读文本层，需人工复核或另存为文本格式';
+          }
+        }
+      }
+      return res;
+    });
+  }
+
+  /**
+   * 只检索文件名本身（不含目录）。
+   * 保密检查软件把文件名一并纳入检索：名为「机密合同.docx」的文件即使正文干净也会被报出，
+   * 而正文扫描对此是 0 命中——用户看到「干净」就不会改名，下一次检查照样中招。
+   * 返回与 scanOffice / scanBytes 同形的结果，部位名固定「文件名」，便于合并到命中位置里。
+   * @returns {{hits:number, matched:string[], hitChars:number, totalChars:number, parts:Array}}
+   */
+  function scanFileName(name, engine) {
+    var res = { hits: 0, matched: [], hitChars: 0, totalChars: 0, parts: [] };
+    var base = String(name || '').replace(/^.*[\\/]/, '');
+    if (!base || !engine) return res;
+    var r;
+    try { r = engine.scan(base, true, true); } catch (e) { return res; }
+    if (!r || !r.hits) return res;
+    res.hits = r.hits;
+    res.matched = (r.matched || []).slice();
+    res.hitChars = r.hitChars || 0;
+    res.totalChars = base.replace(/\s/g, '').length;
+    res.parts = [{ name: base, label: '文件名', hits: r.hits, matched: (r.matched || []).slice() }];
+    return res;
+  }
   global.DWRDoc = {
     TEXT_EXT: TEXT_EXT,
     WORD_EXT: WORD_EXT,
     EXCEL_EXT: EXCEL_EXT,
     PPT_EXT: PPT_EXT,
     OFFICE_EXT: OFFICE_EXT,
+    LEGACY_EXT: LEGACY_EXT,
+    PDF_EXT: PDF_EXT,
+    RTF_EXT: RTF_EXT,
+    ARCHIVE_EXT: ARCHIVE_EXT,
     COMMON_EXT: COMMON_EXT,
     setExtFilter: setExtFilter,
     getExtFilter: getExtFilter,
@@ -1621,6 +1880,13 @@
     kindOf: kindOf,
     isTextFile: isTextFile,
     isOfficeFile: isOfficeFile,
+    isLegacyOfficeFile: isLegacyOfficeFile,
+    isRtfFile: isRtfFile,
+    isPdfFile: isPdfFile,
+    isPdfBytes: isPdfBytes,
+    isArchiveFile: isArchiveFile,
+    isDetectableOnly: isDetectableOnly,
+    isDetectOnly: isDetectOnly,
     isSupported: isSupported,
     decodeText: decodeText,
     encodeText: encodeText,
@@ -1631,9 +1897,12 @@
     verifyOffice: verifyOffice,
     OOXML_LIMITS: OOXML_LIMITS,
     verifyBytes: verifyBytes,
+    scanBytes: scanBytes,
+    scanFileName: scanFileName,
     extractText: extractText,
     extractPreview: extractPreview,
     encodeXml: encodeXml,
-    decodeXml: decodeXml
+    decodeXml: decodeXml,
+    partLabel: partLabel
   };
 })(window);

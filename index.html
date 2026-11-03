@@ -93,7 +93,7 @@
           <label class="switch" data-tip="跳过 node_modules、.git、系统缓存等目录，扫描更快"><input type="checkbox" id="scanSkipSys" checked> 跳过系统和依赖文件夹</label>
           <div class="field">
             <label data-tip="默认只扫常用办公文档，速度快、命中率高；可选全部支持格式，或自己填扩展名">文件格式</label>
-            <select id="scanExtPreset" data-tip="主流格式：docx / xlsx / pptx / txt / md 等常用文档；全部支持格式：含源码与配置，慢但最全；自定义：按右边填的扩展名扫" aria-label="文件格式筛选">
+            <select id="scanExtPreset" data-tip="主流格式：docx / xlsx / pptx / pdf / txt / md 等常用文档；全部支持格式：含源码与配置，慢但最全；自定义：按右边填的扩展名扫" aria-label="文件格式筛选">
               <option value="common">主流格式（推荐）</option>
               <option value="all">全部支持格式</option>
               <option value="custom">自定义</option>
@@ -387,6 +387,9 @@
           <span class="hint" id="scanFilterCount" style="margin:0;"></span>
         </div>
         <p class="scan-tally" id="scanTally" data-tip="本次扫描的合计：命中数、误报数和未检查数，点击可只看对应类别" role="status"></p>
+        <details class="scan-skipped" id="scanSkippedWrap" hidden>
+          <summary>未检查清单</summary>
+        </details>
         <p class="hint">点行预览；<code>Ctrl+Enter</code> 处理，<code>Esc</code> 收起；「从磁盘删除」不可恢复。</p>
         <div class="table-wrap">
           <table>
@@ -475,6 +478,7 @@
   <!-- 引擎按依赖顺序加载 -->
   <script src="js/zip.js"></script>
   <script src="js/rules.js"></script>
+  <script src="js/pdf.js"></script>
   <script src="js/ooxml.js"></script>
   <script src="js/util.js"></script>
   <script src="js/report.js"></script>

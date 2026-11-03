@@ -44,20 +44,25 @@
     /* v4.6 公文文号与常见合规词。
        单独成组、默认可关：这些词命中面比密级词大得多（「通报」「通知」「银行」在日常公文里
        随处可见），整组停用即回到 v4.5 及以前的默认行为，不会改变老用户的处理结果。 */
-    { word: '国发', group: '公文文号' },
-    { word: '国办发', group: '公文文号' },
-    { word: '中发', group: '公文文号' },
-    { word: '中办发', group: '公文文号' },
-    { word: '府办', group: '公文文号' },
-    { word: '府字', group: '公文文号' },
-    { word: '厅字', group: '公文文号' },
-    { word: '组厅字', group: '公文文号' },
-    { word: '政办', group: '公文文号' },
-    { word: '政发', group: '公文文号' },
-    { word: '政字', group: '公文文号' },
-    { word: '汇发', group: '公文文号' },
-    { word: '委办发', group: '公文文号' },
-    { word: '国税函', group: '公文文号' },
+    /* v4.81 公文文号改为「前缀 + 成对括号 + 4 位年份 + 序号」的严格形态（docNumber）。
+       裸词匹配会把常用词切坏：真实语料里「其中发明专利」被判中发、「政府办公室」被判府办、
+       「党政办」被判政办，清除动作直接吞掉正文里的字与数字（该目录 10 份命中 9 份是误报）。
+       公文里的文号始终写成 国发〔2023〕5号，因此要求成对括号与年份；命中区间是完整文号，
+       删除后不会留下半截括号或断句。正则由 createEngine 在装配时生成（依赖归一化表）。 */
+    { word: '国发', group: '公文文号', docNumber: true },
+    { word: '国办发', group: '公文文号', docNumber: true },
+    { word: '中发', group: '公文文号', docNumber: true },
+    { word: '中办发', group: '公文文号', docNumber: true },
+    { word: '府办', group: '公文文号', docNumber: true },
+    { word: '府字', group: '公文文号', docNumber: true },
+    { word: '厅字', group: '公文文号', docNumber: true },
+    { word: '组厅字', group: '公文文号', docNumber: true },
+    { word: '政办', group: '公文文号', docNumber: true },
+    { word: '政发', group: '公文文号', docNumber: true },
+    { word: '政字', group: '公文文号', docNumber: true },
+    { word: '汇发', group: '公文文号', docNumber: true },
+    { word: '委办发', group: '公文文号', docNumber: true },
+    { word: '国税函', group: '公文文号', docNumber: true },
     { word: '邪教', group: '政治安全' },
     { word: '恐怖', group: '政治安全' },
     { word: '藏独', group: '政治安全' },
@@ -145,6 +150,23 @@
   /** 正文出现这些字符时才需走分隔符容错路径 */
   var SEP_SCAN_RE = new RegExp('[' + SEP_CHARS.concat(OPEN_CHARS).concat(CLOSE_CHARS)
     .map(escapeClassChar).join('') + ']');
+
+  /** 文号年份括号的可选写法：国发〔2023〕5号 / 国发[2023]5号 / 国发（2023）5号 */
+  var DOC_YEAR_OPEN = '[〔\\[（(]';
+  var DOC_YEAR_CLOSE = '[〕\\]）)]';
+  var DOC_GAP = '[\\s\\u3000]{0,3}';
+  /**
+   * 公文文号规则源：前缀 + 成对括号 + 4 位年份（+ 序号）。
+   * 文号在真实公文里永远带着括号年份，只匹配裸前缀会把「其中发明专利」「政府办公室」
+   * 「党政办」这类常用词当成文号清掉，因此把年份作为必需结构。
+   * 序号与「号」可缺省（引文里常只写「国发〔2023〕」），年份必须有——
+   * 没有年份就不可能是文号。
+   */
+  function docNumberSource(word) {
+    return tolerantSource(word) + DOC_GAP + DOC_YEAR_OPEN + DOC_GAP
+      + '[0-9]{4}' + DOC_GAP + DOC_YEAR_CLOSE + DOC_GAP
+      + '(?:[0-9]{1,8}' + DOC_GAP + '[号令]?[0-9]{0,8})?';
+  }
 
   /**
    * 繁体 -> 简体 等价字表（每两个字为一对：繁体 + 简体）。
@@ -412,7 +434,11 @@
       var src;
       var label = String(r.label || r.text);
       var normalized = null;
-      if (r.type === 'regex') {
+      if (r.docNumber && r.type !== 'regex') {
+        // 文号：按「前缀+括号年份」匹配，标签仍是原词，报告里读得出「中发」
+        src = docNumberSource(normalizePattern(String(r.text)));
+        normalized = String(r.text);
+      } else if (r.type === 'regex') {
         src = r.text;
       } else {
         normalized = normalizePattern(r.text);

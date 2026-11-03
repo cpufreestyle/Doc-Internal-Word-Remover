@@ -14,13 +14,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import vm from 'vm';
+import zlib from 'zlib';
+import crypto from 'crypto';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function loadEngine(extra = []) {
-  const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js', 'js/util.js'].concat(extra);
+  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js'].concat(extra);
   const code = files.map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
   const ctx = {
     TextEncoder, TextDecoder,
@@ -92,6 +94,203 @@ const presetsEngine = D.DWRRules.createEngine({
   check('formats-pptm 幻灯片与备注均已脱敏',
     s1 && n1 && s1.indexOf('绝密') === -1 && n1.indexOf('机密') === -1,
     'slide=' + s1 + ' notes=' + n1);
+}
+
+/* A2) v4.79 旧版 OLE2 只读检测：.doc/.xls/.ppt 能查不能改，
+   扫描入口必须能按真实文件名解码，而不是被当成 .txt 静默跳过。 */
+{
+  const word = '内部资料';
+  const ole = new Uint8Array(8 + word.length * 2);
+  ole.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1], 0);
+  for (let i = 0; i < word.length; i++) {
+    const c = word.charCodeAt(i);
+    ole[8 + i * 2] = c & 0xff;
+    ole[9 + i * 2] = c >> 8;
+  }
+  check('formats-旧版格式识别为仅检测',
+    D.DWRDoc.isLegacyOfficeFile('a.doc') && D.DWRDoc.isLegacyOfficeFile('a.XLS')
+    && D.DWRDoc.isDetectOnly('a.ppt') && !D.DWRDoc.isOfficeFile('a.doc'));
+  const oleScan = await D.DWRDoc.scanBytes('a.doc', ole, presetsEngine);
+  check('formats-OLE 字节可检出敏感词', oleScan.hits > 0 && oleScan.matched.indexOf('内部') >= 0,
+    JSON.stringify(oleScan));
+  const txtScan = await D.DWRDoc.scanBytes('a.txt', new TextEncoder().encode(word), presetsEngine);
+  check('formats-scanBytes 对文本仍按文本解码', txtScan.hits > 0, JSON.stringify(txtScan));
+  const fakeZip = await D.DWRZip.pack([
+    { name: 'word/document.xml', data: '<w:document><w:body><w:p><w:t>机密</w:t></w:p></w:body></w:document>' },
+  ]);
+  const zipScan = await D.DWRDoc.scanBytes('改名.doc', new Uint8Array(await fakeZip.arrayBuffer()), presetsEngine);
+  check('formats-改名成 .doc 的 OOXML 走 ZIP 全包复检', zipScan.hits > 0, JSON.stringify(zipScan));
+}
+
+/* A3) v4.79 命中位置（parts）：只报「命中 3 处：内部」，用户在正文里翻不到——
+   密级标识常常写在备注页 / 图表 / 文档属性 / 内嵌对象里。必须说出词落在哪个部件。 */
+{
+  const pptx = await D.DWRZip.pack([
+    { name: '[Content_Types].xml', data: '<Types/>' },
+    { name: 'ppt/slides/slide1.xml', data: '<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>内部资料</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>' },
+    { name: 'ppt/notesSlides/notesSlide1.xml', data: '<p:notes><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>机密口径</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>' },
+    { name: 'docProps/core.xml', data: '<cp:coreProperties><dc:title>绝密</dc:title></cp:coreProperties>' }
+  ]);
+  const scan = await D.DWRDoc.scanOffice(new Uint8Array(await pptx.arrayBuffer()).buffer, presetsEngine);
+  check('v479-parts 三个部件分别记账',
+    scan.parts.length === 3, JSON.stringify(scan.parts));
+  const byName = {};
+  scan.parts.forEach((p) => { byName[p.name] = p; });
+  check('v479-parts 备注页被标为「备注」',
+    !!byName['ppt/notesSlides/notesSlide1.xml']
+      && byName['ppt/notesSlides/notesSlide1.xml'].label === '备注'
+      && byName['ppt/notesSlides/notesSlide1.xml'].matched.indexOf('机密') >= 0,
+    JSON.stringify(byName['ppt/notesSlides/notesSlide1.xml']));
+  check('v479-parts 幻灯片与文档属性各有归属',
+    !!byName['ppt/slides/slide1.xml'] && byName['ppt/slides/slide1.xml'].label === '幻灯片'
+      && !!byName['docProps/core.xml'] && byName['docProps/core.xml'].label === '文档属性',
+    JSON.stringify(scan.parts));
+  const sum = scan.parts.reduce((a, p) => a + p.hits, 0);
+  check('v479-parts 各处命中之和等于总命中数', sum === scan.hits,
+    'sum=' + sum + ' hits=' + scan.hits);
+  check('v479-partLabel 认得内嵌文档', D.DWRDoc.partLabel('ppt/embeddings/a.docx') === '内嵌文档',
+    D.DWRDoc.partLabel('ppt/embeddings/a.docx'));
+  // 条目名命中也得记账：保密检查软件解包前就能从 ZIP 目录里检索到
+  const named = await D.DWRZip.pack([
+    { name: '内部.docx', data: '<w:document><w:body><w:p><w:r><w:t>干净</w:t></w:r></w:p></w:body></w:document>' }
+  ]);
+  const nameScan = await D.DWRDoc.scanOffice(new Uint8Array(await named.arrayBuffer()).buffer, presetsEngine);
+  check('v479-parts 条目名命中单独记账',
+    nameScan.hits > 0 && nameScan.parts.length === 1 && nameScan.parts[0].name === '内部.docx',
+    JSON.stringify(nameScan));
+}
+
+/* A4) v4.81 命名空间前缀部件：Google / 豆包 / 部分在线工具导出的 xlsx 写成 <x:c><x:v>，
+   块正则按无前缀的 <v>/<si> 写死会一条都匹配不上，整个部件静默漏检——
+   而外部检查软件解包直读能检出，表现为「我们报干净、它报命中」。 */
+{
+  const prefixed = await D.DWRZip.pack([
+    { name: '[Content_Types].xml', data: '<Types/>' },
+    { name: 'xl/workbook.xml', data: '<x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheets><x:sheet name="内部口径" sheetId="1"/></x:sheets></x:workbook>' },
+    { name: 'xl/worksheets/sheet2.xml', data: '<x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheetData><x:row><x:c r="G6" t="str"><x:v>内部假设</x:v></x:c><x:c r="H6" t="str"><x:v>正常数值</x:v></x:c></x:row></x:sheetData></x:worksheet>' },
+  ]);
+  const ab = await prefixed.arrayBuffer();
+  const scan = await D.DWRDoc.scanOffice(new Uint8Array(ab).buffer, presetsEngine);
+  check('v481-前缀写法部件不再漏检', scan.hits > 0 && scan.matched.indexOf('内部') >= 0,
+    JSON.stringify(scan));
+  const cleaned = await D.DWRDoc.processOffice(ab, presetsEngine);
+  const cz = await D.DWRZip.load(await cleaned.blob.arrayBuffer());
+  const sheet = await cz.getText('xl/worksheets/sheet2.xml');
+  check('v481-前缀部件能真正清除', cleaned.touched && sheet.indexOf('内部') === -1, 'sheet=' + sheet);
+  check('v481-清除时不改动标签前缀', /<x:v>正常数值<\/x:v>/.test(sheet) && /<\/x:worksheet>$/.test(sheet),
+    'sheet=' + sheet);
+  // 预览必须与扫描同一口径：否则「报了命中、正文里翻不到」的问题会原样复现
+  const prev = await D.DWRDoc.extractPreview(ab);
+  check('v481-前缀部件在预览里可见', prev.text.indexOf('内部假设') >= 0, 'preview=' + prev.text);
+  // 常规（无前缀）文档不应被兜底路径重复出行
+  const plainDoc = await D.DWRZip.pack([
+    { name: 'word/document.xml', data: '<w:document><w:body><w:p><w:r><w:t>内部正文</w:t></w:r></w:p><w:p><w:r><w:t>第二段</w:t></w:r></w:p></w:body></w:document>' },
+  ]);
+  const plainPrev = await D.DWRDoc.extractPreview(await plainDoc.arrayBuffer());
+  const bodyLines = plainPrev.text.split('\n').filter((s) => s.indexOf('内部正文') >= 0);
+  check('v481-常规文档预览不重复出行', bodyLines.length === 1, plainPrev.text);
+}
+
+/* A5) v4.81 OLE2 的 UTF-16 有两种字节对齐：字符串在扇区里的起点不保证 2 字节对齐，
+   只解偶数位会让「整体右移 1 字节」的正文完全读不到（实测 .ppt 漏检 13 处）。 */
+{
+  const word = '内部资料';
+  const bytes = new Uint8Array(9 + word.length * 2);
+  bytes.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00], 0); // 1 字节填充 => 词从奇数位起
+  for (let i = 0; i < word.length; i++) {
+    const c = word.charCodeAt(i);
+    bytes[9 + i * 2] = c & 0xff;
+    bytes[10 + i * 2] = c >> 8;
+  }
+  const odd = await D.DWRDoc.scanBytes('错位.ppt', bytes, presetsEngine);
+  check('v481-OLE2 奇数对齐也能检出', odd.hits > 0 && odd.matched.indexOf('内部') >= 0,
+    JSON.stringify(odd));
+  check('v481-错位命中带部位标注',
+    (odd.parts || []).some((p) => String(p.label || p.name).indexOf('错位') >= 0),
+    JSON.stringify(odd.parts));
+}
+
+/* A6) v4.81 文件名命中：检查软件把文件名一并纳入检索，
+   名为「机密合同.docx」的文件正文再干净也会被报出。只检正文会给出「干净」的假结论。 */
+{
+  const r = D.DWRDoc.scanFileName('D:\\资料\\机密合同.docx', presetsEngine);
+  check('v481-文件名含密级词必须报命中',
+    r.hits === 1 && r.matched.indexOf('机密') >= 0, JSON.stringify(r));
+  check('v481-文件名命中部位标为「文件名」且只取 basename',
+    r.parts.length === 1 && r.parts[0].label === '文件名' && r.parts[0].name === '机密合同.docx',
+    JSON.stringify(r.parts));
+  check('v481-干净文件名不误报',
+    D.DWRDoc.scanFileName('统计年鉴2024.xlsx', presetsEngine).hits === 0);
+  // 目录里的敏感词不算文件名命中：那是路径信息，不是文档本身
+  check('v481-只判文件名不含目录',
+    D.DWRDoc.scanFileName('D:\\内部资料\\普通表格.xlsx', presetsEngine).hits === 0,
+    JSON.stringify(D.DWRDoc.scanFileName('D:\\内部资料\\普通表格.xlsx', presetsEngine)));
+  // 缺引擎 / 空名都要安全返回，不能让整轮扫描抛错中断
+  check('v481-空输入安全返回',
+    D.DWRDoc.scanFileName('', presetsEngine).hits === 0
+      && D.DWRDoc.scanFileName('机密.docx', null).hits === 0);
+  const zipBlob = await D.DWRZip.pack([
+    { name: 'word/document.xml', data: '<w:document><w:body><w:p><w:r><w:t>正常正文</w:t></w:r></w:p></w:body></w:document>' },
+  ]);
+  const bodyClean = await D.DWRDoc.scanOffice(new Uint8Array(await zipBlob.arrayBuffer()).buffer, presetsEngine);
+  check('v481-正文干净时仍能靠文件名报出',
+    bodyClean.hits === 0 && D.DWRDoc.scanFileName('机密合同.docx', presetsEngine).hits > 0,
+    JSON.stringify(bodyClean));
+}
+
+/* A7) v4.81 RTF：中文以 \'hh（ANSI 十六进制）/ \uN（码点）转义存放，
+   按普通文本解码得到的是「\\'BB\\'FA」这类转义串，敏感词一个都读不到。
+   真实语料确认存在「扩展名是 .doc、内容其实是 RTF」的文件：只读检测报 0 命中，
+   而外部检查软件报「秘密(2)」。 */
+{
+  /** 用 TextDecoder 反查 GBK 双字节：Node 的 Buffer 不支持 gbk 编码 */
+  function gbkEsc(str) {
+    const dec = new TextDecoder('gbk', { fatal: false });
+    const map = {};
+    for (let hi = 0x81; hi <= 0xFE; hi++) {
+      for (let lo = 0x40; lo <= 0xFE; lo++) {
+        if (lo === 0x7F) continue;
+        const s = dec.decode(new Uint8Array([hi, lo]));
+        if (s.length === 1 && str.includes(s) && !(s in map)) map[s] = [hi, lo];
+      }
+    }
+    let out = '';
+    for (const ch of str) {
+      if (map[ch]) out += "\\'" + map[ch][0].toString(16).toUpperCase().padStart(2, '0') + "\\'" + map[ch][1].toString(16).toUpperCase().padStart(2, '0');
+      else out += ch;
+    }
+    return out;
+  }
+  const mk = (body) => new Uint8Array(Buffer.from('{\\rtf1\\ansi\\ansicpg936\\deff0' + body + '}', 'latin1'));
+  const rtfHex = mk('\\ansicpg936\\par 前 ' + gbkEsc('机密') + ' 后');
+  check('v481-RTF 按内容识别', D.DWRDoc.isRtfFile('a.rtf') && !D.DWRDoc.isSupported('a.rtf'),
+    'rtf 应为只读检测档');
+  check('v481-RTF 归入可只读检测', D.DWRDoc.isDetectableOnly('a.rtf') === true
+    && D.DWRDoc.isDetectOnly('a.rtf') === true);
+  const hexHit = await D.DWRDoc.scanBytes('说明.rtf', rtfHex, presetsEngine);
+  check('v481-RTF 十六进制转义中文能检出',
+    hexHit.hits > 0 && hexHit.matched.indexOf('机密') >= 0, JSON.stringify(hexHit));
+  check('v481-RTF 命中位置标注 RTF',
+    (hexHit.parts || []).some((p) => String(p.label || p.name).indexOf('RTF') >= 0),
+    JSON.stringify(hexHit.parts));
+  // \uN 码点写法（26426=机，23494=密）
+  const uniHit = await D.DWRDoc.scanBytes('b.rtf', mk('\\u26426 ?\\u23494 ?abc'), presetsEngine);
+  check('v481-RTF 码点写法能检出', uniHit.hits > 0 && uniHit.matched.indexOf('机密') >= 0,
+    JSON.stringify(uniHit));
+  // 后缀骗人：内容是 RTF 就要按 RTF 解（真实语料形态）
+  const disguised = await D.DWRDoc.scanBytes('政策文件.doc', rtfHex, presetsEngine);
+  check('v481-伪装成 .doc 的 RTF 仍能检出',
+    disguised.hits > 0 && disguised.matched.indexOf('机密') >= 0, JSON.stringify(disguised));
+  // 反向骗人：内容是 OLE2 就按 OLE2 解，不能被 rtf 后缀带偏
+  const ole = new Uint8Array(10 + 4);
+  ole.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0], 0);
+  const oleHit = await D.DWRDoc.scanBytes('a.rtf', ole, presetsEngine);
+  check('v481-OLE2 签名优先于 rtf 后缀',
+    oleHit.parts.every((p) => String(p.label || p.name).indexOf('RTF') < 0),
+    JSON.stringify(oleHit.parts));
+  // 干净 RTF 不误报
+  const cleanRtf = await D.DWRDoc.scanBytes('c.rtf', mk('\\par 普通文字'), presetsEngine);
+  check('v481-干净 RTF 不误报', cleanRtf.hits === 0, JSON.stringify(cleanRtf));
 }
 
 /* ================= B. 规则语义：正则反向引用与标签归属 ================= */
@@ -391,7 +590,7 @@ const presetsEngine = D.DWRRules.createEngine({
 
 /* C9b) v4.67 格式跳过计数：把检查文件类型列为检查项——
    我们把不支持格式静默 continue 掉时，用户会误以为扫过但没命中。
-   本块用真实 CLI 扫一个含图片 + .doc + .txt 的目录，验证概要出现「格式未匹配」行。 */
+   v4.79 起 .doc 进入只读检测，不再计入「格式未匹配」；图片仍然计入。 */
 {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dwr-ext-'));
   fs.writeFileSync(path.join(base, 'a.txt'), '内部资料首行\n正文\n机密尾行\n', 'utf8');
@@ -400,8 +599,8 @@ const presetsEngine = D.DWRRules.createEngine({
   const rr = spawnSync(process.execPath, [path.join(__dirname, 'scan.mjs'),
     '--dir', base, '--json'], { cwd: __dirname, encoding: 'utf8', maxBuffer: 1 << 26 });
   const out = String(rr.stdout || '');
-  check('v467-CLI 概要含格式未匹配行',
-    /格式未匹配\s+: 2 个/.test(out),
+  check('v467-CLI 概要含格式未匹配行（图片 1 个，.doc 已只读检测）',
+    /格式未匹配\s+: 1 个/.test(out),
     out.slice(-400));
   check('v467-CLI 格式未匹配行说明图片需人工复核',
     /图片内文字需人工复核/.test(out),
@@ -626,7 +825,7 @@ const presetsEngine = D.DWRRules.createEngine({
     check('cli-CSV 使用 CRLF 行尾', text.indexOf('\r\n') >= 0);
     check('cli-CSV 含逗号的路径被引号包裹',
       /"([^"]*b,comma\.txt)"/.test(text), text.split('\r\n')[1] || '');
-    check('cli-CSV 列数正确（5 列）',
+    check('cli-CSV 列数正确（6 列）',
       text.trim().split('\r\n').every((ln) => {
         if (!ln) return true;
         let n = 1, inQ = false;
@@ -634,7 +833,7 @@ const presetsEngine = D.DWRRules.createEngine({
           if (ch === '"') inQ = !inQ;
           else if (ch === ',' && !inQ) n++;
         }
-        return n === 5;
+        return n === 6;
       }), text);
   }
 
@@ -905,13 +1104,13 @@ const presetsEngine = D.DWRRules.createEngine({
     const docxPath = path.join(hsrc, '工作', 'a.docx');
     fs.writeFileSync(docxPath, Buffer.from(await hDocx.arrayBuffer()));
     fs.writeFileSync(path.join(hsrc, 'b.txt'), '机密说明\n普通内容\n', 'utf8');
-    fs.writeFileSync(path.join(hsrc, 'c.pdf'), Buffer.from([1, 2, 3]));
+    fs.writeFileSync(path.join(hsrc, 'c.rar'), Buffer.from([1, 2, 3]));
 
     const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const htmlRows = [
       ['a.docx', docxPath, '1024', '内部(1)'],
       ['b.txt', path.join(hsrc, 'b.txt'), '32', '机密(2)|内部(1)'],
-      ['c.pdf', path.join(hsrc, 'c.pdf'), '2048', '秘密(1)'],
+      ['c.rar', path.join(hsrc, 'c.rar'), '2048', '秘密(1)'],
       ['a.docx', docxPath, '1024', '内部(1)'], // 跨分节重复：应去重
     ];
     let html = '<html><body><table>'
@@ -925,7 +1124,7 @@ const presetsEngine = D.DWRRules.createEngine({
     const hr = run(['--from-report', htmlReport, '--authorized-root', hsrc, '--out', hout, '--root', hsrc]);
     check('cli-from-report 解析 HTML 报告（UTF-16LE，4 行去重为 3 条）',
       hr.status === 0 && /3 条/.test(hr.stdout || ''), (hr.stdout || '').slice(-200) + (hr.stderr || '').slice(0, 200));
-    check('cli-from-report 生成 2 个副本、跳过 1 个不支持的 PDF',
+    check('cli-from-report 生成 2 个副本、跳过 1 个不支持的 RAR',
       /生成脱敏副本: 2 个/.test(hr.stdout || '') && /不支持格式\s+: 1 个/.test(hr.stdout || ''), (hr.stdout || '').slice(-260));
     check('cli-from-report 输出镜像目录结构',
       fs.existsSync(path.join(hout, '工作', 'a.docx')) && fs.existsSync(path.join(hout, 'b.txt')),
@@ -1884,6 +2083,9 @@ const presetsEngine = D.DWRRules.createEngine({
       const mz = await D.DWRZip.load(all.buffer.slice(0));
       let gSync = null, gP = null;
       try { gP = mz.getBytes('word/document.xml'); } catch (e) { gSync = e.message; }
+      // 这里只验「返回 Promise 而非同步抛」，但同一个 Promise 会被下面复用；
+      // 先挂一个空 catch，避免 Node 在断言之间把它报成未处理的 rejection。
+      if (gP && typeof gP.catch === 'function') gP.catch(function () {});
       check('v464-getBytes(method=99) 返回 Promise 而非同步抛',
         gSync === null && !!gP && typeof gP.then === 'function',
         'gSync=' + gSync);
@@ -1904,6 +2106,401 @@ const presetsEngine = D.DWRRules.createEngine({
         'scSync=' + scSync + ' scRej=' + scRej);
     }
   }
+/* ================= S. v4.81 正文读不到也要按文件名报出 =================
+   保密检查软件按「文件名 + 正文」一起检索。此前 .pdf / 压缩包 / 超大文件在格式门槛
+   处就 continue，用户看到「命中 0」以为全盘干净，而外部检查软件照样把这些文件开出来
+   （真值比对里 5 个「仅文件名中招」的文件全部漏报）。 */
+{
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'dwr-v481-name-'));
+  const run = (args) => spawnSync(process.execPath, [path.join(__dirname, 'scan.mjs'), ...args], { cwd: __dirname, encoding: 'utf8' });
+  const num = (o, label) => { const m = new RegExp(label + ' : (\\d+)').exec(o); return m ? +m[1] : -1; };
+
+  // 1) PDF 正文干净，文件名含「机密」——必须报出，且说清正文没读
+  {
+    const root = tmp();
+    fs.writeFileSync(path.join(root, '机密数据汇编.rar'), Buffer.from([0x52, 0x61, 0x72, 0x21]), 'latin1');
+    fs.writeFileSync(path.join(root, '普通统计.rar'), Buffer.from([0x52, 0x61, 0x72, 0x21]), 'latin1');
+    const out = run(['--dir', root, '--json', '--scope', 'all']).stdout;
+    check('v481-压缩包正文读不到但文件名含敏感词要报命中', num(out, '命中文档数') === 1, 'out=\n' + out);
+    check('v481-仅文件名命中单独计数', /仅文件名命中: 1 个/.test(out), out);
+    check('v481-命中行位置标「仅文件名」并说明正文未读',
+      /\[仅文件名\][\s\S]*机密数据汇编\.rar[\s\S]*正文未读取/.test(out), out);
+    check('v481-文件名干净的压缩包不误报（仍计入未检查）',
+      /格式未匹配\s+: 2 个/.test(out) && !/普通统计\.rar[\s\S]*命中/.test(out), out);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  // 2) 报告里要留下可核对的痕迹：位置=仅文件名、detectOnly 挡住批量删除
+  {
+    const root = tmp();
+    const rep = path.join(root, 'rep.json');
+    fs.writeFileSync(path.join(root, '内部资料.rar'), Buffer.from([0x52, 0x61, 0x72, 0x21]), 'latin1');
+    run(['--dir', root, '--json', '--scope', 'all', '--report', rep]);
+    const rows = JSON.parse(fs.readFileSync(rep, 'utf8'));
+    check('v481-JSON 报告标 nameOnly + detectOnly',
+      rows.length === 1 && rows[0].nameOnly === true && rows[0].detectOnly === true
+        && rows[0].unreadReason && rows[0].parts[0].label === '文件名',
+      JSON.stringify(rows));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  // 3) 超大文件：正文不读。用受支持的后缀才有机会走到大小门槛（不支持的格式在格式门槛
+  //   就被拦下，计入「格式未匹配」而非「超大」）；--max-file-mb 0 会退回默认 32MB，必须给正数。
+  {
+    const root = tmp();
+    fs.writeFileSync(path.join(root, '秘密台账.docx'), Buffer.alloc(1024 * 1500, 0x41));
+    fs.writeFileSync(path.join(root, '普通台账.docx'), Buffer.alloc(1024 * 1500, 0x42));
+    const out = run(['--dir', root, '--json', '--scope', 'all', '--max-file-mb', '1']).stdout;
+    check('v481-超过大小上限仍按文件名报出', num(out, '命中文档数') === 1 && /仅文件名命中: 1 个/.test(out), out);
+    check('v481-超大命中说明正文未读', /正文未读取（超过大小上限）/.test(out), out);
+    check('v481-超大仍计入跳过数', /超大已跳过\s+: 2 个/.test(out), out);
+    check('v481-超大不重复计入格式未匹配', !/格式未匹配/.test(out), out);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  // 4) 脱敏模式不算命中：改名由用户决定，工具不代做，也不能把没读过的东西写进输出
+  {
+    const root = tmp();
+    const outDir = path.join(root, 'out');
+    fs.writeFileSync(path.join(root, '机密汇编.rar'), Buffer.from([0x52, 0x61, 0x72, 0x21]), 'latin1');
+    const out = run(['--dir', root, '--clean', '--out', outDir, '--json', '--scope', 'all']).stdout;
+    check('v481-脱敏模式不按文件名造命中',
+      num(out, '命中文档数') === 0 && !/仅文件名命中/.test(out), out);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  // 5) CSV 的「位置」列要写「仅文件名」，Excel 里能一眼筛出来
+  {
+    const root = tmp();
+    run(['--dir', root, '--scope', 'all']);
+    fs.writeFileSync(path.join(root, '机密汇编.rar'), Buffer.from([0x52, 0x61, 0x72, 0x21]), 'latin1');
+    const csv = path.join(root, 'r.csv');
+    run(['--dir', root, '--scope', 'all', '--report', csv]);
+    const txt = fs.readFileSync(csv, 'utf8');
+    check('v481-CSV 位置列为仅文件名', /仅文件名/.test(txt), txt);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/* ================= T. v4.82 PDF 正文提取 =================
+   PDF 此前被判为「不支持格式」，只能靠文件名。真实比对里 116 个被外部检查软件报出
+   的 PDF 只有 4 个能从文件名看出来——剩下 112 个是纯漏报，这是全口径召回率
+   （79.3%）唯一的缺口。这里用最小可解析 PDF 锁住四条能力：zlib 解压、ToUnicode
+   还原、汉字间空白归一、表单 XObject（页眉/水印常放在里面）。 */
+{
+  const tmpPdf = () => fs.mkdtempSync(path.join(os.tmpdir(), 'dwr-pdf-'));
+  const CMAP = [
+    '/CIDInit /ProcSet findresource begin',
+    '12 dict begin',
+    'begincmap',
+    '/CMapName /Adobe-Identity-UCS def',
+    '/CMapType 2 def',
+    '1 begincodespacerange',
+    '<0000> <FFFF>',
+    'endcodespacerange',
+    '2 beginbfchar',
+    '<0001> <5185>',
+    '<0020> <0020>',
+    'endbfchar',
+    '1 beginbfrange',
+    '<0002> <0002> <90E8>',
+    'endbfrange',
+    'endcmap',
+    'CMapName currentdict /CMap defineresource pop',
+    'end',
+    'end',
+  ].join('\n');
+
+  /** 拼一份最小 PDF：1 catalog / 2 pages / 3 page / 4 font / 5 contents / 6 form / 7 ToUnicode */
+  function makePdf(opts) {
+    opts = opts || {};
+    const compress = !!opts.compress;
+    const content = opts.content || 'BT /F1 12 Tf <00010002> Tj ET';
+    const form = opts.form || null;
+    const enc = (s) => Buffer.from(s, 'latin1');
+    const stream = (body, extra) => {
+      const raw = enc(body);
+      const data = compress ? zlib.deflateSync(raw) : raw;
+      return Buffer.concat([
+        enc('<< /Length ' + data.length + (compress ? ' /Filter /FlateDecode' : '') + (extra || '') + ' >>\nstream\n'),
+        data,
+        enc('\nendstream'),
+      ]);
+    };
+    const pageRes = '/Resources << /Font << /F1 4 0 R >>' + (form ? ' /XObject << /X1 6 0 R >>' : '') + ' >>';
+    const parts = [
+      enc('%PDF-1.4\n'),
+      enc('1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n'),
+      enc('2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n'),
+      enc('3 0 obj << /Type /Page /Parent 2 0 R ' + pageRes + ' /Contents 5 0 R >> endobj\n'),
+      enc('4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /ToUnicode 7 0 R >> endobj\n'),
+      enc('5 0 obj '), stream(content), enc('\nendobj\n'),
+    ];
+    if (form) {
+      parts.push(enc('6 0 obj << /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /Font << /F1 4 0 R >> >> >> '));
+      parts.push(stream(form));
+      parts.push(enc('\nendobj\n'));
+    }
+    parts.push(enc('7 0 obj '), stream(CMAP), enc('\nendobj\n'));
+    parts.push(enc('trailer << /Root 1 0 R >>\n%%EOF\n'));
+    return Buffer.concat(parts);
+  }
+
+  const pdf = makePdf({});
+  const pdfScan = await D.DWRDoc.scanBytes('说明.pdf', new Uint8Array(pdf), presetsEngine);
+  check('v482-PDF 正文能检出密级词', pdfScan.hits > 0 && pdfScan.matched.indexOf('内部') >= 0,
+    JSON.stringify(pdfScan));
+  check('v482-PDF 命中位置标为 PDF 正文',
+    pdfScan.parts.length === 1 && /PDF正文$/.test(pdfScan.parts[0].name || ''),
+    JSON.stringify(pdfScan.parts));
+
+  const zipped = makePdf({ compress: true });
+  const zipScan = await D.DWRDoc.scanBytes('压缩.pdf', new Uint8Array(zipped), presetsEngine);
+  check('v482-FlateDecode 压缩流能解出正文',
+    zipScan.hits > 0 && zipScan.matched.indexOf('内部') >= 0, JSON.stringify(zipScan));
+
+  const spaced = makePdf({ content: 'BT /F1 12 Tf <000100200002> Tj ET' });
+  const spScan = await D.DWRDoc.scanBytes('逐字.pdf', new Uint8Array(spaced), presetsEngine);
+  check('v482-汉字之间的空白会被归一（逐字定位的标题）',
+    spScan.hits > 0 && spScan.matched.indexOf('内部') >= 0, JSON.stringify(spScan));
+
+  const withForm = makePdf({ content: 'q /X1 Do Q', form: 'BT /F1 12 Tf <00010002> Tj ET' });
+  const fmScan = await D.DWRDoc.scanBytes('表单.pdf', new Uint8Array(withForm), presetsEngine);
+  check('v482-表单 XObject 里的文字也能检出（页眉 / 水印常放这里）',
+    fmScan.hits > 0 && fmScan.matched.indexOf('内部') >= 0, JSON.stringify(fmScan));
+
+  const disguised = await D.DWRDoc.scanBytes('改名.doc', new Uint8Array(pdf), presetsEngine);
+  check('v482-按签名识别：改名成 .doc 的 PDF 仍能读正文',
+    disguised.hits > 0 && disguised.matched.indexOf('内部') >= 0, JSON.stringify(disguised));
+
+  const clean = makePdf({ content: 'BT /F1 12 Tf <0001> Tj ET' });
+  const cleanScan = await D.DWRDoc.scanBytes('干净.pdf', new Uint8Array(clean), presetsEngine);
+  check('v482-干净 PDF 不误报', cleanScan.hits === 0, JSON.stringify(cleanScan));
+
+  const broken = Buffer.from('%PDF-1.4\n1 0 obj << >> endobj\n', 'latin1');
+  const brokenScan = await D.DWRDoc.scanBytes('损坏.pdf', new Uint8Array(broken), presetsEngine);
+  check('v482-损坏 PDF 不崩、不误报', brokenScan.hits === 0, JSON.stringify(brokenScan));
+
+  check('v482-PDF 归入主流格式与只读检测',
+    D.DWRDoc.COMMON_EXT.indexOf('pdf') >= 0
+      && D.DWRDoc.isPdfFile('a.PDF') && D.DWRDoc.isDetectableOnly('a.pdf')
+      && D.DWRDoc.isDetectOnly('a.pdf') && !D.DWRDoc.isSupported('a.pdf'));
+
+  /* 对象流：PDF 1.5+ 把页面、字体整块压进 /ObjStm，文件里一个 /Type /Page 都搜不到。
+     不展开就是「整份 0 字」——本工具会报干净，而检查软件照样读出命中。 */
+  {
+    const content = 'BT /F1 12 Tf <00010002> Tj ET';
+    const head = '3 0 ';
+    const objBody = '<</Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R>>';
+    const objstm = head + objBody;
+    const bytes = Buffer.from([
+      '%PDF-1.5\n',
+      '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n',
+      '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n',
+      '4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /ToUnicode 7 0 R >> endobj\n',
+      '5 0 obj << /Length ' + content.length + ' >>\nstream\n' + content + '\nendstream endobj\n',
+      '6 0 obj << /Type /ObjStm /N 1 /First ' + head.length + ' /Length ' + objstm.length + ' >>\nstream\n' + objstm + '\nendstream endobj\n',
+      '7 0 obj << /Length ' + CMAP.length + ' >>\nstream\n' + CMAP + '\nendstream endobj\n',
+      'trailer << /Root 1 0 R >>\n%%EOF\n',
+    ].join(''), 'latin1');
+    const sc = await D.DWRDoc.scanBytes('对象流.pdf', new Uint8Array(bytes), presetsEngine);
+    check('v482-页面藏在对象流（ObjStm）里也能读',
+      sc.hits > 0 && sc.matched.indexOf('内部') >= 0, JSON.stringify(sc));
+  }
+
+  /* 空用户口令加密：政企 PDF 常「只设权限密码」。保密检查软件按空口令解开，
+     本工具不解就等于整份漏检。用 Node crypto 独立算密钥/加密做交叉验证。 */
+  {
+    const PAD = Buffer.from([
+      0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08,
+      0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A]);
+    const md5b = (b) => crypto.createHash('md5').update(b).digest();
+    const rc4b = (key, data) => {
+      const S = new Uint8Array(256);
+      let j = 0;
+      for (let i = 0; i < 256; i++) S[i] = i;
+      for (let i = 0; i < 256; i++) { j = (j + S[i] + key[i % key.length]) & 255; const t = S[i]; S[i] = S[j]; S[j] = t; }
+      const out = Buffer.alloc(data.length);
+      let i = 0; j = 0;
+      for (let k = 0; k < data.length; k++) {
+        i = (i + 1) & 255; j = (j + S[i]) & 255;
+        const t = S[i]; S[i] = S[j]; S[j] = t;
+        out[k] = data[k] ^ S[(S[i] + S[j]) & 255];
+      }
+      return out;
+    };
+    const makeEncryptedPdf = (mode) => {
+      const content = 'BT /F1 12 Tf <00010002> Tj ET';
+      const R = mode === 'aes' ? 4 : 3;
+      const P = -44;
+      const id = Buffer.alloc(16, 7);
+      const O = Buffer.alloc(32, 9);
+      let key = md5b(Buffer.concat([PAD, O, Buffer.from([P & 255, (P >> 8) & 255, (P >> 16) & 255, (P >>> 24) & 255]), id]));
+      for (let i = 0; i < 50; i++) key = md5b(key.subarray(0, 16));
+      key = key.subarray(0, 16);
+      const objKey = (num) => md5b(Buffer.concat([
+        key,
+        Buffer.from([num & 255, (num >> 8) & 255, (num >> 16) & 255, 0, 0]),
+        mode === 'aes' ? Buffer.from('sAlT') : Buffer.alloc(0),
+      ])).subarray(0, 16);
+      const enc = (num, data) => {
+        const k = objKey(num);
+        if (mode === 'aes') {
+          const iv = Buffer.alloc(16, 3);
+          const c = crypto.createCipheriv('aes-128-cbc', k, iv);
+          c.setAutoPadding(false);
+          const padded = Buffer.concat([data, Buffer.alloc((16 - (data.length % 16)) % 16)]);
+          return Buffer.concat([iv, c.update(padded), c.final()]);
+        }
+        return rc4b(k, data);
+      };
+      const streamObj = (num, body, filter) => {
+        let raw = Buffer.from(body, 'latin1');
+        if (filter) raw = zlib.deflateSync(raw);
+        const data = enc(num, raw);
+        return Buffer.concat([
+          Buffer.from(num + ' 0 obj << /Length ' + data.length + (filter ? ' /Filter /FlateDecode' : '') + ' >>\nstream\n', 'latin1'),
+          data,
+          Buffer.from('\nendstream endobj\n', 'latin1'),
+        ]);
+      };
+      const dict = mode === 'aes'
+        ? '<</Filter/Standard/V 4/R 4/Length 128/CF<</StdCF<</CFM/AESV2/Length 16>>>>/StmF/StdCF/StrF/StdCF/O<' + O.toString('hex') + '>/U<' + O.toString('hex') + '>/P ' + P + '>>'
+        : '<</Filter/Standard/V 2/R 3/Length 128/O<' + O.toString('hex') + '>/U<' + O.toString('hex') + '>/P ' + P + '>>';
+      return Buffer.concat([
+        Buffer.from('%PDF-1.5\n', 'latin1'),
+        Buffer.from('1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n'
+          + '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n'
+          + '3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n'
+          + '4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /ToUnicode 7 0 R >> endobj\n', 'latin1'),
+        streamObj(5, content, true),
+        streamObj(7, CMAP, false),
+        Buffer.from('8 0 obj ' + dict + ' endobj\n', 'latin1'),
+        Buffer.from('trailer << /Root 1 0 R /Encrypt 8 0 R /ID[<' + id.toString('hex') + '><' + id.toString('hex') + '>] >>\n%%EOF\n', 'latin1'),
+      ]);
+    };
+    for (const mode of ['rc4', 'aes']) {
+      const bytes = makeEncryptedPdf(mode);
+      const ext = D.DWRPdf.extract(new Uint8Array(bytes));
+      const sc = await D.DWRDoc.scanBytes('加密.pdf', new Uint8Array(bytes), presetsEngine);
+      check('v482-' + mode + ' 空口令加密 PDF 能解出正文（' + mode + '）',
+        ext && ext.encrypted === true && sc.hits > 0 && sc.matched.indexOf('内部') >= 0,
+        JSON.stringify({ enc: ext && ext.encrypted, sc: sc }));
+    }
+  }
+
+  /* 压缩包：外部检查软件会解包后逐条检索，所以这里也解开——包括包里直接放的
+     docx / xlsx / pdf，以及条目名本身。 */
+  {
+    const innerDocx = await D.DWRZip.pack([
+      { name: '[Content_Types].xml', data: '<Types/>' },
+      { name: 'word/document.xml', data: '<w:document><w:body><w:p><w:t>内部资料</w:t></w:p></w:body></w:document>' },
+    ]);
+    const zipBytes = new Uint8Array(await (await D.DWRZip.pack([
+      { name: '资料/说明.docx', data: new Uint8Array(await innerDocx.arrayBuffer()) },
+      { name: '普通.txt', data: 'hello' },
+    ])).arrayBuffer());
+    const zs = await D.DWRDoc.scanBytes('打包.zip', zipBytes, presetsEngine);
+    check('v482-压缩包里的 Office 文档能检出',
+      zs.hits > 0 && zs.matched.indexOf('内部') >= 0, JSON.stringify(zs));
+    check('v482-压缩包命中位置带包内路径',
+      (zs.parts[0].name || '').indexOf('说明.docx') >= 0, JSON.stringify(zs.parts));
+
+    const named = await D.DWRZip.pack([{ name: '机密清单.txt', data: 'nothing' }]);
+    const ns = await D.DWRDoc.scanBytes('x.zip', new Uint8Array(await named.arrayBuffer()), presetsEngine);
+    check('v482-压缩包条目名含密级词也算命中',
+      ns.hits > 0 && ns.matched.indexOf('机密') >= 0, JSON.stringify(ns));
+
+    const cleanZip = await D.DWRZip.pack([{ name: 'readme.txt', data: 'hello world' }]);
+    const cs = await D.DWRDoc.scanBytes('干净.zip', new Uint8Array(await cleanZip.arrayBuffer()), presetsEngine);
+    check('v482-干净压缩包不误报', cs.hits === 0, JSON.stringify(cs));
+    check('v482-压缩包归入只读检测',
+      D.DWRDoc.isArchiveFile('a.ZIP') && D.DWRDoc.isDetectableOnly('a.zip') && !D.DWRDoc.isSupported('a.zip'));
+  }
+
+  /* 修订痕迹与隐藏文字：外部检查软件解包后直读 XML，会把删掉的旧文字和设了
+     w:vanish 的隐藏文字一并检出。本工具扫描范围已把 w:delText / w:instrText 放进
+     段落组，w:vanish 只改 w:rPr 不改 w:t，按普通文本也能读到，不误报。 */
+  {
+    const docxXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+      '<w:p><w:r><w:delText>删除的秘密内容</w:delText></w:r></w:p>' +
+      '<w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>隐藏的内部机密</w:t></w:r></w:p>' +
+      '<w:p><w:r><w:t>正常的公开内容</w:t></w:r></w:p>' +
+      '</w:body></w:document>';
+    const zip = D.DWRZip;
+    const entries = [
+      { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>' },
+      { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>' },
+      { name: 'word/_rels/document.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>' },
+      { name: 'word/document.xml', data: docxXml },
+    ];
+    const docx = await zip.pack(entries);
+    const buf = new Uint8Array(await docx.arrayBuffer());
+    const sc = await D.DWRDoc.scanOffice(buf.buffer.slice(0), presetsEngine);
+    check('v482-修订删除文字 (w:delText) 能检出敏感词',
+      sc.hits > 0 && sc.matched.indexOf('秘密') >= 0, JSON.stringify(sc));
+    check('v482-隐藏文字 (w:vanish) 能检出敏感词',
+      sc.hits > 0 && sc.matched.indexOf('内部') >= 0 && sc.matched.indexOf('机密') >= 0, JSON.stringify(sc));
+    const cl = await D.DWRDoc.processOffice(buf.buffer.slice(0), presetsEngine);
+    const cleaned = await D.DWRZip.load(await cl.blob.arrayBuffer());
+    const docPartBuf = new Uint8Array(await cleaned.getBytes('word/document.xml'));
+    const xml = new TextDecoder('utf-8').decode(docPartBuf);
+    check('v482-修订/隐藏文字被清除且不破坏正文',
+      cl.touched && !/<w:delText[^>]*>([^<]*(秘密|内部))<\/w:delText>/.test(xml)
+        && !/<w:t[^>]*>([^<]*(内部|机密))<\/w:t>/.test(xml)
+        && /正常的公开内容/.test(xml) && /<\/w:document>/.test(xml),
+      'touched=' + cl.touched + ' xml=' + xml.slice(0, 120));
+  }
+
+  // 目录扫描：PDF 应当被真正读进来，而不是记到「格式未匹配」
+  {
+    const root = tmpPdf();
+    fs.writeFileSync(path.join(root, '统计公报.pdf'), pdf);
+    const out = spawnSync(process.execPath, [path.join(__dirname, 'scan.mjs'), '--dir', root, '--json', '--scope', 'all'],
+      { cwd: __dirname, encoding: 'utf8' }).stdout;
+    const m = /命中文档数 : (\d+)/.exec(out);
+    check('v482-目录扫描把 PDF 当正文读（不是格式未匹配）',
+      !!m && +m[1] === 1 && !/格式未匹配/.test(out) && /PDF正文/.test(out), out);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  /* 扫描件：只有图片流、没有文本层的 PDF。本工具不做 OCR，必须明确标「扫描件，
+     需人工复核」，不能把「没读」说成「干净」；保密检查软件按空口令解开也读不出文本，
+     双方都会标出来，人工复核与外部报告口径一致。 */
+  {
+    const imgBytes = Buffer.from('%PDF-1.4\n' +
+      '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n' +
+      '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n' +
+      '3 0 obj << /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 4 0 R >> >> /Contents 5 0 R >> endobj\n' +
+      '4 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 1 >>\nstream\n\x00\nendstream endobj\n' +
+      '5 0 obj << /Length 9 >>\nstream\n/Im1 Do\nendstream endobj\n' +
+      'trailer << /Root 1 0 R >>\n%%EOF\n', 'latin1');
+    const er = D.DWRPdf.extract(new Uint8Array(imgBytes));
+    check('v482-只有图片流的 PDF 标记为扫描件（imageOnly）',
+      er && er.imageOnly === true && er.chars <= 1 && er.pages === 1,
+      JSON.stringify(er));
+    const is = await D.DWRDoc.scanBytes('扫描件.pdf', new Uint8Array(imgBytes), presetsEngine);
+    check('v482-scanBytes 透传扫描件标记（imageOnly + 原因）',
+      is.imageOnly === true && !!is.unreadReason && is.hits === 0,
+      JSON.stringify(is));
+
+    const mixed = Buffer.from('%PDF-1.4\n' +
+      '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n' +
+      '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n' +
+      '3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >> endobj\n' +
+      '4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /ToUnicode 7 0 R >> endobj\n' +
+      '5 0 obj << /Length ' + ('BT /F1 12 Tf <00010002> Tj ET').length + ' >>\nstream\nBT /F1 12 Tf <00010002> Tj ET\nendstream endobj\n' +
+      '6 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length 1 >>\nstream\n\x00\nendstream endobj\n' +
+      '7 0 obj << /Length ' + CMAP.length + ' >>\nstream\n' + CMAP + '\nendstream endobj\n' +
+      'trailer << /Root 1 0 R >>\n%%EOF\n', 'latin1');
+    const mr = D.DWRPdf.extract(new Uint8Array(mixed));
+    check('v482-图文混合 PDF 不标扫描件（文本层还在）',
+      mr && mr.imageOnly === false && mr.chars > 0,
+      JSON.stringify(mr));
+  }
+}
+
 console.log('\n==== ' + (fail === 0 ? '全部通过' : '存在失败') + ' ====');
 console.log('PASS: ' + pass + '  FAIL: ' + fail);
 process.exit(fail === 0 ? 0 : 1);

@@ -23,7 +23,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 async function loadEngine() {
-  const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js', 'js/util.js'];
+  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js'];
   const code = files.map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
   const ctx = {
     TextEncoder, TextDecoder,
@@ -125,7 +125,7 @@ const D = await loadEngine();
 function presetRules() {
   return D.DWRRules.DEFAULT_PRESETS.map((p) => ({
     text: p.word, type: 'text', enabled: true,
-    notBefore: p.notBefore, notAfter: p.notAfter, whole: p.whole
+    notBefore: p.notBefore, notAfter: p.notAfter, whole: p.whole, docNumber: p.docNumber
   }));
 }
 function engine(rules, extra) {
@@ -925,6 +925,37 @@ const defaultEngine = engine(presetRules());
     check('v454-默认词库下国家秘密仍清除',
       clean('国家秘密事项', e) === '国家事项',
       JSON.stringify(clean('国家秘密事项', e)));
+  }
+
+  /* v4.81 公文文号必须带「括号 + 4 位年份」。裸词匹配在真实语料里全是误报，
+     而且误报会真的改坏正文：「其中发明专利」被当文号清成「其中明专利」之类断句。 */
+  {
+    const docEngine = D.DWRRules.createEngine({
+      rules: D.DWRRules.DEFAULT_PRESETS.map(function (p) {
+        return { text: p.word, type: 'text', enabled: true,
+          notBefore: p.notBefore, notAfter: p.notAfter, docNumber: p.docNumber };
+      }),
+      scope: 'all', action: 'delete', custom: '',
+    });
+    check('v481-常用词不再被当文号误伤',
+      clean('其中发明专利申请1677件', docEngine) === '其中发明专利申请1677件'
+        && clean('政府办公室关于印发党政办通知', docEngine).indexOf('政府办公室') >= 0,
+      JSON.stringify([clean('其中发明专利申请1677件', docEngine), clean('政府办公室关于印发党政办通知', docEngine)]));
+    check('v481-真文号仍然命中（六角括号）',
+      clean('国发〔2023〕5号有关规定', docEngine) === '有关规定',
+      JSON.stringify(clean('国发〔2023〕5号有关规定', docEngine)));
+    check('v481-真文号命中兼容方括号与空格',
+      clean('中发[2024]1号 与 中发 〔 2020 〕 3 号', docEngine) === ' 与 ',
+      JSON.stringify(clean('中发[2024]1号 与 中发 〔 2020 〕 3 号', docEngine)));
+    check('v481-文号命中词仍是原词便于阅读',
+      D.DWRRules.DEFAULT_PRESETS.filter((p) => p.docNumber).length === 14
+        && docEngine.scan('沪府办〔2022〕12号').matched.indexOf('府办') >= 0,
+      JSON.stringify(docEngine.scan('沪府办〔2022〕12号')));
+    // --words 由用户显式给出，不套括号年份要求
+    const bare = engine([{ text: '中发', type: 'text', enabled: true }]);
+    check('v481-自定义裸词保持原匹配口径',
+      clean('其中发明专利', bare) === '其明专利',
+      JSON.stringify(clean('其中发明专利', bare)));
   }
 }
 console.log('\n==== ' + (fail === 0 ? '全部通过' : '存在失败') + ' ====');

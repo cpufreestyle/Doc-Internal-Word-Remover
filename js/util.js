@@ -81,7 +81,7 @@
 
   /** 报告列定义：`cols` 决定 CSV 表头与每行取值顺序（row[key] 为 undefined 时输出空串） */
   var CLEAN_COLS = ['file', 'hits', 'matched', 'status', 'out'];
-  var SCAN_COLS = ['path', 'kind', 'size', 'hits', 'matched', 'ratio'];
+  var SCAN_COLS = ['path', 'kind', 'size', 'hits', 'matched', 'ratio', 'mode', 'parts'];
 
   /**
    * 通用 CSV 报告构造：CRLF 行尾 + 行首 `#` 元信息注释行，Excel 双击可直接打开。

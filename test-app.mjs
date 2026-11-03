@@ -231,7 +231,7 @@ const localStorageStub = {
 /* ---------------- 加载真实引擎 + 真实 app.js ---------------- */
 
 // js/format.js / js/ui.js / js/dircache.js 必须在 app.js 之前：app.js 只保留各自的同名引用
-const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js', 'js/util.js', 'js/report.js', 'js/format.js', 'js/ui.js', 'js/dircache.js', 'js/undo.js', 'js/reporthtml.js', 'js/app.js'];
+const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js', 'js/report.js', 'js/format.js', 'js/ui.js', 'js/dircache.js', 'js/undo.js', 'js/reporthtml.js', 'js/app.js'];
 const code = files.map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
 
 const errors = [];
@@ -479,12 +479,12 @@ const D = ctx.window;
   const duplicateIds = htmlIds.filter((id, i) => htmlIds.indexOf(id) !== i);
   check('v477-index.html 的 id 全局唯一',
     duplicateIds.length === 0, '重复 id: ' + Array.from(new Set(duplicateIds)).join(', '));
-    check('v459-app.js 动态悬停说明数锁死为 11',
-      appTips === 11, 'appTips=' + appTips + ' README 写 11');
+    check('v459-app.js 动态悬停说明数锁死为 15',
+      appTips === 15, 'appTips=' + appTips + ' README 写 15');
     // README 里的数字必须与代码一致：改一边不改另一边就会误导用户
     check('v459-README 的说明数与代码一致',
       README2.indexOf('index.html` 的 147 处解释') >= 0
-        && README2.indexOf('动态生成的 11 处') >= 0,
+        && README2.indexOf('动态生成的 15 处') >= 0,
       'README 与代码不同步');
     check('v476-单栏窄屏优先显示文件区',
       /@media \(max-width: 1080px\) \{[\s\S]*?\.layout > section\.panel-column \{\s*order: 1;/.test(CSS2)
@@ -873,6 +873,8 @@ check('app-默认词库已载入', /已载入默认敏感词库/.test(logText())
       { text: '机密', type: 'text', enabled: true, group: '密级标识', notBefore: ['商业'] },
       { text: '绝密', type: 'text', enabled: true, group: '密级标识', notBefore: ['商业'] },
       { text: '秘密', type: 'text', enabled: true, group: '自定义', notBefore: ['商业'] },
+      { text: '中发', type: 'text', enabled: true, group: '公文文号' },
+      { text: '中发', type: 'text', enabled: true, group: '自定义' },
       { text: '自定义词', type: 'text', enabled: true, group: '自定义' }
     ],
     options: {}
@@ -896,7 +898,15 @@ check('app-默认词库已载入', /已载入默认敏感词库/.test(logText())
     migrated.rules.some((r) => r.text === '秘密' && r.group === '自定义'
       && r.notBefore && r.notBefore.indexOf('商业') >= 0),
     JSON.stringify(migrated.rules));
-  check('v475-迁移后写入设置版本', migrated.settingsVersion === 3, JSON.stringify(migrated));
+  check('v481-迁移后写入设置版本', migrated.settingsVersion === 4, JSON.stringify(migrated));
+  // v4.81 老设置里存的是裸词，不补标记会继续把「其中发明专利」清成断句
+  check('v481-迁移把默认公文文号换成严格形态',
+    migrated.rules.some((r) => r.text === '中发' && r.docNumber === true),
+    JSON.stringify(migrated.rules));
+  check('v481-迁移不动用户自己加的词（要什么查什么）',
+    migrated.rules.some((r) => r.text === '中发' && r.group === '自定义' && !r.docNumber)
+      && migrated.rules.some((r) => r.text === '自定义词' && !r.docNumber),
+    JSON.stringify(migrated.rules.filter((r) => r.text === '中发')));
 
   migrated.rules.push({ text: '涉密', type: 'text', enabled: true, group: '自定义' });
   reloadApp({ [key]: JSON.stringify(migrated) });
@@ -974,7 +984,7 @@ const cleanBytes = new TextEncoder().encode('普通文档内容\n不含任何目
 /** 用独立引擎实例解析导出的 ZIP（避免复用被测上下文的状态） */
 async function loadZip(blob) {
   const buf = new Uint8Array(await blob.arrayBuffer());
-  const vcode = ['js/zip.js', 'js/rules.js', 'js/ooxml.js']
+  const vcode = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js']
     .map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
   const v = {
     TextEncoder, TextDecoder,
@@ -2690,13 +2700,13 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
   const root = fakeDriveRoot("C盘", new Map([
     ["工作\\涉密文件.txt", enc("本文件含内部资料，属机密范围。\n")],
     ["工作\\公开说明.txt", enc("本文件为公开信息，可以外发。\n")],
-    ["资料\\旧版文档.pdf", enc("%PDF-1.4 fake")],
+    ["资料\\旧版压缩包.rar", enc("Rar! fake")],
   ]));
   ctx.showDirectoryPicker = async () => root;
   const report = fakeReportFile("检查报告.json", [
     { file: "C:\\工作\\涉密文件.txt", hits: 3, matched: ["内部", "机密", "秘密"], size: 100 },
     { file: "C:\\工作\\公开说明.txt", hits: 1, matched: ["秘密"], size: 60 },
-    { file: "C:\\资料\\旧版文档.pdf", hits: 2, matched: ["机密"], size: 4096 },
+    { file: "C:\\资料\\旧版压缩包.rar", hits: 2, matched: ["机密"], size: 4096 },
   ]);
   change("reportFile", { target: { files: [report], value: "" } });
   const impOk = await waitFor(() => /已导入 3 条/.test(logText()), 30000);
@@ -3451,7 +3461,9 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
     RH.indexOf('DEFAULT_LIMITS') >= 0 && RH.indexOf('ul class="limits"') >= 0,
     '局限声明缺失');
   check('v38-scanSummary 已标分级与依据',
-    APP.indexOf("['已检查文件数', s.scanned, 'obs',") >= 0
+    APP.indexOf("['遍历文件数', s.scanned, 'obs',") >= 0
+      && APP.indexOf("['实际检查文件数', s.checked || s.scanned, 'obs',") >= 0
+      && APP.indexOf("['未检查文件数', skipTotal(s), 'obs',") >= 0
       && APP.indexOf("['结果完整', s.truncated ? '否（已达上限）' : '是', 'der',") >= 0,
     'scanSummary 未标分级');
   check('v38-扫描报告传入结论',
@@ -3569,7 +3581,7 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
   // v4.3 主流格式 + 自定义筛选：引擎层真实运行断言
   {
     const vm = await import('vm');
-    const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js', 'js/util.js'].map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
+    const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js'].map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
     const c = { TextEncoder, TextDecoder, CompressionStream: globalThis.CompressionStream, DecompressionStream: globalThis.DecompressionStream,
       Blob: globalThis.Blob, Response: globalThis.Response, Uint8Array, DataView, Array, Object, String, RegExp, Math, JSON, Promise, console };
     c.window = c;
@@ -3577,7 +3589,7 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
     vm.runInContext(files, c);
     const W = c.window.DWRDoc;
     check('v43-主流格式清单导出',
-      W.COMMON_EXT.join(',') === 'docx,xlsx,pptx,txt,md,csv,rtf,docm,xlsm,pptm',
+      W.COMMON_EXT.join(',') === 'docx,xlsx,pptx,pdf,doc,xls,ppt,txt,md,csv,rtf,docm,xlsm,pptm,zip',
       'COMMON=' + W.COMMON_EXT.join(','));
     check('v43-默认不限制时 txt 通过',
       W.isSupported('a.txt') === true,
@@ -3680,7 +3692,8 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
       APP.indexOf("var low = String(name).toLowerCase();") >= 0,
       '仍可能用全路径判定');
     check('v410-扫描入口前置过滤（不读文件就判掉）',
-      APP.indexOf('if (!nameHit(name, opts.nameWords, opts.nameMode)) { stats.nameSkipped = (stats.nameSkipped || 0) + 1; continue; }') >= 0,
+      APP.indexOf('if (!nameHit(name, opts.nameWords, opts.nameMode)) {') >= 0
+        && APP.indexOf("noteSkip(stats, filePath, 'name-filter');") >= 0,
       '前置过滤缺失');
     check('v410-scanOpts 带上 nameWords 与 nameMode',
       APP.indexOf("nameWords: parseNameWords($('scanNameWords') ? $('scanNameWords').value : ''),") >= 0,
@@ -3692,6 +3705,17 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
     check('v410-扫描概要报告跳过的文件数（源码接线）',
       APP.indexOf("['文件名未匹配', s.nameSkipped || 0, 'obs', '文件名不含指定关键字，未读取直接跳过'],") >= 0,
       '概要行缺失');
+    // v4.81 扫描入口必须无条件并入文件名命中：检查软件按「文件名 + 正文」检索，
+    // 只检正文会给用户「这个文件干净」的假结论（名为「机密合同.docx」照样被报出）。
+    check('v481-扫描把文件名命中并入结果（不依赖正文是否命中）',
+      APP.indexOf('var nm = Doc.scanFileName(path, opts.engine);') >= 0
+        && APP.indexOf('parts = parts.concat(nm.parts || []);') >= 0,
+      '扫描入口未接线');
+    // 接线位置必须在「正文命中判断」之外：退回到 if (hits > 0) 里就会静默失效
+    check('v481-文件名命中不受正文判断门控',
+      APP.indexOf('if (Doc.scanFileName) {') >= 0
+        && APP.indexOf('if (hits > 0) {\n        // 文件名') < 0,
+      '文件名判定被正文条件挡住');
   // v4.22 起 scanSummary 的 3 条断言全是源码字符串检查，报告的概要行从来没被行为验证过。
   // 这里用 vm 抽真实函数 + 注入 state 桩真跑：nameSkipped 为 0 时也要出行（不能悄悄省略），
   // 且导入报告的批次要额外插两行（检查软件口径）。
@@ -3722,7 +3746,7 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
   const SS = (function () {
     // v4.65 起 scanSummary 里多了 fmtRatio(scanArchiveRatio())，只抽它自己就会抛
     // ReferenceError——依赖必须一起抽进来，否则这段行为验证从 v4.65 就是死的。
-    const body = ['fmtRatio', 'scanArchiveRatio', 'scanSummary']
+    const body = ['fmtRatio', 'scanArchiveRatio', 'skipTotal', 'skipBreakdown', 'scanSummary']
       .map(sliceFn).join('\n');
     if (body.indexOf('function scanSummary') < 0) return null;
     vm.runInContext(body, SS_CTX);
@@ -3763,6 +3787,49 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
     const rowNil = SS().filter((r) => r[0] === '平均命中占比')[0];
     check('v469-无命中文件时占比显示 -（不显示 0%）',
       !!rowNil && rowNil[1] === '-', JSON.stringify(rowNil));
+  }
+
+  /* v4.79 命中位置（parts）：只报「命中 3 处：内部」，用户在正文里翻不到——
+     密级标识常常写在备注页 / 图表 / 文档属性 / 内嵌对象里。位置必须能一句话说清。 */
+  {
+    const HP_CTX = vm.createContext({
+      Doc: {
+        partLabel: function (n) {
+          var s = String(n).toLowerCase();
+          if (/embeddings\//.test(s)) return '内嵌文档';
+          if (/^ppt\//.test(s)) return /notes/.test(s) ? '备注' : '幻灯片';
+          return String(n);
+        }
+      },
+      console: console,
+    });
+    const hpBody = ['partText', 'hitPartsText'].map(sliceFn).join('\n');
+    const HP = (function () {
+      if (hpBody.indexOf('function hitPartsText') < 0) return null;
+      vm.runInContext(hpBody, HP_CTX);
+      return vm.runInContext('hitPartsText', HP_CTX);
+    })();
+    check('v479-hitPartsText 可抽取', typeof HP === 'function', '抽取失败');
+    if (typeof HP === 'function') {
+      const txt = HP([
+        { name: 'ppt/slides/slide1.xml', label: '幻灯片', hits: 1, matched: ['内部'] },
+        { name: 'ppt/notesSlides/notesSlide1.xml', label: '备注', hits: 2, matched: ['机密'] }
+      ]);
+      check('v479-hitPartsText 报出部件名、路径与处数',
+        txt.indexOf('幻灯片（ppt/slides/slide1.xml） × 1 处：内部') >= 0
+          && txt.indexOf('备注（ppt/notesSlides/notesSlide1.xml） × 2 处：机密') >= 0,
+        txt);
+      check('v479-hitPartsText 缺 label 时回落到 partLabel',
+        HP([{ name: 'ppt/embeddings/a.docx', hits: 1, matched: ['内部'] }])
+          .indexOf('内嵌文档（ppt/embeddings/a.docx）') >= 0, '回落失效');
+      const many = new Array(8).fill(0).map((_, i) => ({
+        name: 'p' + i + '.xml', label: 'P' + i, hits: 1, matched: ['内部']
+      }));
+      check('v479-hitPartsText 部件过多时截断并给总数',
+        /等 8 个部位/.test(HP(many, 6)), '截断失效');
+      check('v479-hitPartsText 空输入返回空串',
+        HP([]) === '' && HP(null) === '' && HP(undefined) === '', '空输入异常');
+    }
   }
     // 顺带修掉的重复键：finishScan 里 review 被写了两次
     check('v410-finishScan 的 review 键只出现一次（修重复键）',
@@ -3932,15 +3999,18 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
     // 和下面的 v43-Office * 四条覆盖（v4.44 清理冗余时删掉了对应的静态版）。
     const SCAN = fs.readFileSync(path.join(__dirname, 'scan.mjs'), 'utf8');
     check('v45-CSV 与 HTML 报告都有命中占比列',
-      SCAN.indexOf("'file,hits,matched,pos,ratio'") >= 0
+      SCAN.indexOf("'file,hits,matched,pos,ratio,parts'") >= 0
         && SCAN.indexOf('命中占比</th>') >= 0 && SCAN.indexOf('c-ratio') >= 0,
       '报告列缺失');
+    check('v479-CLI 报告带命中位置列',
+      SCAN.indexOf('c-parts') >= 0 && SCAN.indexOf('命中位置</th>') >= 0,
+      '命中位置列缺失');
     // 源码字符串查不出「分母有没有真的加对」，这里用真实引擎 + 真实 docx / xlsx 跑一遍：
     // 三处文本来源（正文块 / 属性值 / 简单文本节点）都必须计入分母。
     // v4.43 修复前 replaceAttrs 漏累计，命中只在工作表名上时分母为 0。
     {
       const vm = await import('vm');
-      const src = ['js/zip.js', 'js/rules.js', 'js/ooxml.js', 'js/util.js']
+      const src = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js']
         .map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
       const c = {
         TextEncoder, TextDecoder,

@@ -8,7 +8,7 @@
 const CACHE = 'dwr-v6';
 const ASSETS = [
   './index.html', './css/style.css',
-  './js/zip.js', './js/rules.js', './js/ooxml.js', './js/util.js', './js/worker.js', './js/report.js',
+  './js/zip.js', './js/rules.js', './js/pdf.js', './js/ooxml.js', './js/util.js', './js/worker.js', './js/report.js',
   './js/format.js', './js/ui.js', './js/dircache.js',
   // app.js 是应用主逻辑，漏掉它断网时页面能打开但工具完全不能用（v4.27 修）
     './js/app.js',

@@ -1,6 +1,6 @@
 {
   "name": "doc-internal-word-remover",
-  "version": "4.78.1",
+  "version": "4.82.0",
   "private": true,
   "description": "文档敏感词清除工具：Word/Excel/PowerPoint 与文本文件的敏感词扫描、清除与报告解析（零运行时依赖）",
   "license": "MIT",

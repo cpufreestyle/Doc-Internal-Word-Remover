@@ -52,7 +52,8 @@
       hit: ['t-hit', '命中'],
       error: ['t-err', '失败'],
       pending: ['t-mute', '未处理'],
-      clean: ['t-mute', '无命中']
+      clean: ['t-mute', '无命中'],
+      detect: ['t-hit', '仅检测']
     };
     var m = map[status] || ['t-mute', String(status || '-')];
     return '<span class="tag ' + m[0] + '">' + esc(m[1]) + '</span>';
@@ -72,7 +73,7 @@
   /** 默认的处理范围与局限（与界面顶部提示一致，报告里给完整版） */
   var DEFAULT_LIMITS = [
     '图片、截图、图表内的文字不在处理范围内（本工具不做 OCR）。',
-    'PDF 与旧版二进制 Office 格式（.doc / .xls / .ppt）不在处理范围内。',
+    'PDF 与压缩包、镜像等不在处理范围内；旧版 .doc / .xls / .ppt 仅做只读检测，不能清除，需另存为 OOXML 后处理。',
     '宏（VBA）内的文本无法自动处理，需人工复核。',
     '嵌入的 OLE 对象需人工复核。',
     '无命中不等于安全，重要文件请人工复核后分发。'

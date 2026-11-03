@@ -25,7 +25,7 @@ function check(name, ok, detail) {
 }
 
 function loadEngine() {
-  const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js'];
+  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js'];
   const code = files.map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
   const ctx = {
     TextEncoder, TextDecoder,

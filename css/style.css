@@ -1252,6 +1252,42 @@ mark {
 .scan-tally b.on {
   background: var(--row-hover);
 }
+/* 未检查清单：默认折叠，展开后按原因 + 路径逐条列出 */
+.scan-skipped {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.scan-skipped summary {
+  cursor: pointer;
+  color: var(--brand-1);
+  font-weight: 500;
+}
+.scan-skipped .skip-list {
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.scan-skipped .skip-list li {
+  display: flex;
+  gap: 8px;
+  padding: 4px 8px;
+  border-top: 1px solid var(--line);
+}
+.scan-skipped .skip-list li:first-child { border-top: 0; }
+.scan-skipped .skip-reason {
+  flex: 0 0 auto;
+  color: var(--danger-text);
+  white-space: nowrap;
+}
+.scan-skipped .skip-path {
+  color: var(--text);
+  word-break: break-all;
+}
 @keyframes dwr-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: .35; }
@@ -1394,6 +1430,15 @@ td.op-col {
 td > .hit-words {
   margin-top: 3px;
 
+}
+
+/* 命中位置：说明每个词落在哪个部件（备注 / 图表 / 文档属性 / 内嵌对象） */
+.hit-parts {
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+  word-break: break-all;
 }
 td .kw {
   display: inline-block;

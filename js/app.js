@@ -31,7 +31,9 @@
 
   var STORE_KEY = 'dwr.settings.v2';
   // 设置结构版本：v4.75 起四个默认密级词不再排除「商业」前缀。
-  var SETTINGS_VERSION = 3;
+  /* v4.81 升到 4：公文文号需要重跑一次迁移，把老设置里的裸词换成「前缀+括号年份」严格形态。
+     不升版本，老用户会继续按裸词清除，把「其中发明专利」这类正文改坏。 */
+  var SETTINGS_VERSION = 4;
   var MAX_FILE_BYTES = 120 * 1024 * 1024; // 单文件上限 120MB
   var MARK_START = '';
   var MARK_END = '';
@@ -234,6 +236,14 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
           changed = true;
         }
       }
+      /* v4.81 公文文号改走「前缀 + 括号年份」严格形态。
+         老设置里存的是裸词，不补标记就会继续把「其中发明专利」「政府办公室」清成断句。
+         只认默认词库里的文号词：用户自己加的词不动，他要什么就查什么。 */
+      if (type === 'text' && r.group === '公文文号' && !r.docNumber && !r.pattern
+          && Rules.DEFAULT_PRESETS.some(function (p) { return p.docNumber && p.word === r.text; })) {
+        r.docNumber = true;
+        changed = true;
+      }
       out.push(r);
     });
     return { rules: out, changed: changed };
@@ -282,7 +292,7 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       }
       if (needsUpgrade && Array.isArray(s.rules)) {
         saveSettings();
-        if (migrated) log('已更新默认词库：不再默认保留「商业秘密」等商业写法。', 'info');
+        if (migrated) log('已更新默认词库：公文文号改为按「前缀 + 括号年份」匹配，不再误伤常用词。', 'info');
       }
       return true;
     } catch (e) { return false; }
@@ -644,6 +654,8 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       if (p.notBefore) r.notBefore = p.notBefore.slice();
       if (p.notAfter) r.notAfter = p.notAfter.slice();
       if (p.whole) r.whole = true;
+      // 公文文号按「前缀+括号年份」匹配，避免「其中发明专利」这类常用词被误清
+      if (p.docNumber) r.docNumber = true;
       return r;
     });
     renderRules();
@@ -1116,6 +1128,7 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         var out = { text: r.text, type: r.type, enabled: true };
         if (r.label) out.label = r.label;
         if (r.whole) out.whole = true;
+        if (r.docNumber) out.docNumber = true;
         var nb = ctxList(r.notBefore);
         if (nb.length) out.notBefore = nb;
         var na = ctxList(r.notAfter);
@@ -1170,10 +1183,12 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
             var dec = Doc.decodeText(buf);
             var r = Doc.processText(dec.text, engine);
             it.hits = r.hits; it.matched = r.matched;
+            it.parts = r.touched ? [{ name: '（全文）', label: '（全文）', hits: r.hits, matched: r.matched.slice() }] : [];
             it.status = r.touched ? 'hit' : 'clean';
           } else {
             return Doc.scanOffice(buf, engine).then(function (res) {
               it.hits = res.hits; it.matched = res.matched;
+              it.parts = res.parts || [];
               it.status = res.hits > 0 ? 'hit' : 'clean';
             });
           }
@@ -1212,18 +1227,60 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
   async function scanOneFile(job, opts, stats) {
     var handle = job.handle, path = job.path;
     if (state.scanCancel) return;
+    // 旧版 .doc/.xls/.ppt 只读检测：能查敏感词，但不能原地清除（会破坏 OLE2 结构）
+    var detectOnly = Doc.isDetectOnly(path);
+    if (!detectOnly && !Doc.isSupported(path)) {
+      noteSkip(stats, path, 'unsupported');
+      // 正文读不了不等于不会被报出：检查软件连 .pdf / 压缩包的文件名一起检索。
+      // 名字里带密级词的这类文件必须照样列出来，否则「命中 0」是假结论。
+      noteNameOnly(job, opts, stats, '格式不支持');
+      return;
+    }
     try {
       var file = await handle.getFile();
-      if (file.size > MAX_FILE_BYTES) return;
+      if (file.size > MAX_FILE_BYTES) {
+        noteSkip(stats, path, 'too-big');
+        noteNameOnly(job, opts, stats, '超过大小上限');
+        return;
+      }
       var buf = await file.arrayBuffer();
+      stats.checked++;
       var hits = 0, matched = [], hitChars = 0, totalChars = 0;
-      if (Doc.isTextFile(path)) {
+      var parts = [];
+      var imageOnly = false, unreadReason = '';
+      if (detectOnly) {
+        var sb = await Doc.scanBytes(path, new Uint8Array(buf), opts.engine);
+        hits = sb.hits; matched = sb.matched;
+        parts = sb.parts || [];
+        imageOnly = !!sb.imageOnly;
+        unreadReason = sb.unreadReason || '';
+      } else if (Doc.isTextFile(path)) {
         var dec = Doc.decodeText(buf);
         var r = Doc.processText(dec.text, opts.engine);
         hits = r.hits; matched = r.matched; hitChars = r.hitChars || 0; totalChars = r.totalChars || 0;
+        if (hits > 0) parts = [{ name: '（全文）', label: '（全文）', hits: hits, matched: matched.slice() }];
       } else {
         var s = await Doc.scanOffice(buf, opts.engine);
         hits = s.hits; matched = s.matched; hitChars = s.hitChars || 0; totalChars = s.totalChars || 0;
+        parts = s.parts || [];
+      }
+      // 文件名也按「检查软件口径」计入命中：名为「机密合同.docx」的文件正文再干净也会被报出。
+      // 必须在正文判断之外无条件执行——只有文件名中招的文件正是最容易漏掉的一类。
+      if (Doc.scanFileName) {
+        var nm = Doc.scanFileName(path, opts.engine);
+        if (nm.hits) {
+          hits += nm.hits;
+          totalChars += nm.totalChars || 0;
+          hitChars += nm.hitChars || 0;
+          (nm.matched || []).forEach(function (w) { if (matched.indexOf(w) < 0) matched.push(w); });
+          parts = parts.concat(nm.parts || []);
+        }
+      }
+      // 扫描件 PDF（无可读文本层）即使 0 命中也必须留痕：没读到不等于干净。
+      // 0 命中的进「未检查清单」，命中行照常在表格里打「扫描件」标签。
+      if (imageOnly) {
+        stats.imageOnly++;
+        if (hits === 0) noteSkip(stats, path, 'scanned');
       }
       if (hits > 0) {
         stats.hitFiles++;
@@ -1231,15 +1288,49 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         var row = {
           path: path, handle: handle, file: file, dir: job.dir, name: job.name,
           size: file.size, hits: hits, matched: matched.slice(), selected: true,
-          hitChars: hitChars, totalChars: totalChars, ratio: totalChars > 0 ? hitChars / totalChars : 0
+          hitChars: hitChars, totalChars: totalChars, ratio: totalChars > 0 ? hitChars / totalChars : 0,
+          detectOnly: detectOnly, parts: parts, imageOnly: imageOnly, unreadReason: unreadReason
         };
+        if (detectOnly) stats.detectOnly++;
         state.scanResults.push(row);
         state.scanArchive.push(row);
         scanTableRender.schedule();
       }
     } catch (e) {
       stats.errors++;
+      noteSkip(stats, path, 'unreadable');
+      noteNameOnly(job, opts, stats, '文件读取失败');
     }
+  }
+
+  /**
+   * 「只靠文件名就中招」的行（v4.81）：正文没读（格式不支持 / 超大 / 读不动），
+   * 但文件名本身含敏感词——保密检查软件按「文件名 + 正文」一起检索，这类文件
+   * 会被原样开出来。计入命中并标「仅文件名」，同时保持 detectOnly：
+   * 本工具没看过正文，不能声称已清除，也不允许加入处理列表或从磁盘删除。
+   * @returns {boolean} 是否新增了一行
+   */
+  function noteNameOnly(job, opts, stats, why) {
+    var path = job.path;
+    if (!Doc.scanFileName) return false;
+    var nm;
+    try { nm = Doc.scanFileName(path, opts.engine); } catch (e) { return false; }
+    if (!nm || !nm.hits) return false;
+    stats.hitFiles++;
+    stats.totalHits += nm.hits;
+    if (!stats.nameOnly) stats.nameOnly = 0;
+    stats.nameOnly++;
+    var row = {
+      path: path, handle: job.handle, file: null, dir: job.dir, name: job.name,
+      size: 0, hits: nm.hits, matched: (nm.matched || []).slice(), selected: false,
+      hitChars: nm.hitChars || 0, totalChars: nm.totalChars || 0,
+      ratio: nm.totalChars > 0 ? (nm.hitChars || 0) / nm.totalChars : 0,
+      detectOnly: true, nameOnly: true, unreadReason: why, parts: nm.parts || []
+    };
+    state.scanResults.push(row);
+    state.scanArchive.push(row);
+    scanTableRender.schedule();
+    return true;
   }
 
   /**
@@ -1269,12 +1360,25 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         if (handle.kind !== 'file') continue;
 
         stats.scanned++;
-        if (stats.scanned >= opts.maxFiles) { stats.truncated = true; break; }
-        if (!Doc.isSupported(name)) continue;
+        var filePath = prefix ? prefix + '/' + name : name;
+        if (stats.scanned >= opts.maxFiles) {
+          stats.truncated = true;
+          noteSkip(stats, filePath, 'limit');
+          break;
+        }
+        // 旧版 Office 只读检测；其余不支持的格式不再静默跳过，记入未检查清单
+        if (!Doc.isSupported(name) && !Doc.isDetectOnly(name)) {
+          noteSkip(stats, filePath, 'unsupported');
+          continue;
+        }
         // v4.10 文件名关键字前置过滤：不读文件就判掉，省掉整块 IO
-        if (!nameHit(name, opts.nameWords, opts.nameMode)) { stats.nameSkipped = (stats.nameSkipped || 0) + 1; continue; }
+        if (!nameHit(name, opts.nameWords, opts.nameMode)) {
+          stats.nameSkipped = (stats.nameSkipped || 0) + 1;
+          noteSkip(stats, filePath, 'name-filter');
+          continue;
+        }
 
-      batch.push({ handle: handle, name: name, dir: dirHandle, path: prefix ? prefix + '/' + name : name });
+      batch.push({ handle: handle, name: name, dir: dirHandle, path: filePath });
       }
 
       if (batch.length) {
@@ -1299,6 +1403,7 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       }
     } catch (e) {
       stats.errors++; // 无权限或已损坏的目录，跳过
+      noteSkip(stats, prefix || '(根目录)', 'no-permission');
     }
   }
 
@@ -1419,7 +1524,47 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
 
   /** 目录扫描的计数器（两个扫描入口共用，新增口径时只改这里） */
   function newScanStats() {
-    return { scanned: 0, hitFiles: 0, totalHits: 0, errors: 0, truncated: false, lastLog: 0, nameSkipped: 0 };
+    return {
+      scanned: 0, checked: 0, hitFiles: 0, totalHits: 0, errors: 0,
+      truncated: false, lastLog: 0, nameSkipped: 0, detectOnly: 0,
+      nameOnly: 0, imageOnly: 0,
+      skipped: [], skipCounts: {}
+    };
+  }
+
+  /* v4.79 未检查清单：文件被跳过时必须留下路径和原因，否则「命中 0」会被误读成「全部干净」 */
+  var SKIP_REASON_LABEL = {
+    unsupported: '格式不支持',
+    'too-big': '超过大小上限',
+    unreadable: '读取失败',
+    'name-filter': '文件名未匹配',
+    limit: '达到文件数上限',
+    'no-permission': '目录无权限',
+    scanned: '扫描件 PDF（无文本层）'
+  };
+  // 路径明细只留样本，计数永远准确：整盘扫描时未检查文件可能上百万，全存会撑爆内存
+  var SKIP_SAMPLE_MAX = 500;
+
+  function noteSkip(stats, path, reason) {
+    if (!stats) return;
+    if (!stats.skipCounts) stats.skipCounts = {};
+    stats.skipCounts[reason] = (stats.skipCounts[reason] || 0) + 1;
+    if (!stats.skipped) stats.skipped = [];
+    if (stats.skipped.length < SKIP_SAMPLE_MAX) stats.skipped.push({ path: path, reason: reason });
+  }
+
+  function skipTotal(stats) {
+    if (!stats || !stats.skipCounts) return 0;
+    var n = 0;
+    Object.keys(stats.skipCounts).forEach(function (k) { n += stats.skipCounts[k] || 0; });
+    return n;
+  }
+
+  function skipBreakdown(stats) {
+    if (!stats || !stats.skipCounts) return '';
+    return Object.keys(stats.skipCounts).filter(function (k) { return stats.skipCounts[k] > 0; })
+      .map(function (k) { return (SKIP_REASON_LABEL[k] || k) + ' ' + stats.skipCounts[k]; })
+      .join(' · ');
   }
 
   /* v4.68 实时状态条 + 彩色合计行：
@@ -1449,7 +1594,15 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     var el = $('scanTally');
     if (!el) return;
     var rows = state.scanResults || [];
-    if (!rows.length) { el.innerHTML = ''; el.style.display = 'none'; return; }
+    var skipAll = skipTotal(state.lastScan);
+    if (!rows.length) {
+      if (!skipAll) { el.innerHTML = ''; el.style.display = 'none'; renderScanSkipped(); return; }
+      el.style.display = '';
+      el.innerHTML = '本次结果：未发现命中 · 未检查文件 <b class="t-un" data-skip="1"'
+        + ' title="点此展开未检查清单">' + skipAll + '</b>';
+      renderScanSkipped();
+      return;
+    }
     el.style.display = '';
     var hit = 0, fp = 0, un = 0;
     rows.forEach(function (r) {
@@ -1458,13 +1611,59 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     });
     var cur = state.scanFilterStatus || 'all';
     var cls = function (st) { return st === cur ? ' on' : ''; };
+    var skipN = skipTotal(state.lastScan);
     el.innerHTML = '本次结果：命中 <b class="t-hit' + cls('hit') + '" data-st="hit"'
       + ' aria-pressed="' + (cur === 'hit') + '">' + hit + '</b>' +
       (fp ? ' · 误报 <b class="t-fp' + cls('fp') + '" data-st="fp"'
         + ' aria-pressed="' + (cur === 'fp') + '">' + fp + '</b>' : '') +
       (un ? ' · 未检查 <b class="t-un' + cls('unchecked') + '" data-st="unchecked"'
         + ' aria-pressed="' + (cur === 'unchecked') + '">' + un + '</b>' : '') +
+      (skipN ? ' · 未检查文件 <b class="t-un" data-skip="1" title="点此展开未检查清单">' + skipN + '</b>' : '') +
       ' · 共 ' + rows.length + ' 条';
+    renderScanSkipped();
+  }
+
+  /** 未检查清单：按原因汇总 + 路径样本，展开即可核对「哪些文件没查、为什么没查」 */
+  function renderScanSkipped() {
+    var wrap = $('scanSkippedWrap');
+    if (!wrap) return;
+    var s = state.lastScan;
+    var total = skipTotal(s);
+    if (!total) { wrap.hidden = true; wrap.innerHTML = ''; return; }
+    wrap.hidden = false;
+    var sample = (s.skipped || []).slice(0, 300);
+    wrap.innerHTML = '<summary>未检查清单（' + total + ' 个：' + escapeHtml(skipBreakdown(s)) + '）</summary>'
+      + '<p class="hint">这些文件没有纳入本次检查，导出报告时会一并带上。'
+      + (sample.length < total ? '下方只列出前 ' + sample.length + ' 个示例路径，完整计数见上方。' : '')
+      + '</p><ul class="skip-list">'
+      + sample.map(function (x) {
+        return '<li><span class="skip-reason">' + escapeHtml(SKIP_REASON_LABEL[x.reason] || x.reason)
+          + '</span><span class="skip-path">' + escapeHtml(x.path) + '</span></li>';
+      }).join('')
+      + '</ul><div class="btn-row"><button type="button" class="ghost" id="scanSkipExportBtn"'
+      + ' data-tip="导出未检查清单（路径 + 原因），可用 Excel 打开">导出未检查清单</button></div>';
+    var btn = $('scanSkipExportBtn');
+    if (btn) btn.addEventListener('click', exportSkippedReport);
+  }
+
+  /** 导出未检查清单 CSV：首部是各原因计数，随后是路径样本 */
+  function exportSkippedReport() {
+    var s = state.lastScan;
+    var total = skipTotal(s);
+    if (!total) { log('本次没有未检查文件', 'warn'); return; }
+    var csvFn = (global.DWRUtil && global.DWRUtil.csvCell) || function (v) { return String(v == null ? '' : v); };
+    var lines = [];
+    Object.keys(s.skipCounts || {}).forEach(function (k) {
+      if (s.skipCounts[k] > 0) lines.push(['#原因', SKIP_REASON_LABEL[k] || k, s.skipCounts[k]].map(csvFn).join(','));
+    });
+    lines.push(['#未检查合计', total].map(csvFn).join(','));
+    lines.push(['原因', '文件路径'].join(','));
+    (s.skipped || []).forEach(function (x) {
+      lines.push([SKIP_REASON_LABEL[x.reason] || x.reason, x.path].map(csvFn).join(','));
+    });
+    var csv = String.fromCharCode(0xfeff) + lines.join('\r\n') + '\r\n';
+    download(new Blob([csv], { type: 'text/csv' }), '未检查清单_' + tsName() + '.csv');
+    log('已导出未检查清单（' + total + ' 个，明细 ' + (s.skipped || []).length + ' 条）', 'ok');
   }
 
   /** 进入扫描态：复位上一轮、亮出结果卡片、放开停止按钮（两个扫描入口共用） */
@@ -1487,8 +1686,14 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       time: stamp(),
       root: rootLabel,
       scanned: stats.scanned,
+      checked: stats.checked || 0,
       hitFiles: stats.hitFiles,
       totalHits: stats.totalHits,
+      detectOnly: stats.detectOnly || 0,
+      imageOnly: stats.imageOnly || 0,
+      nameOnly: stats.nameOnly || 0,
+      skipped: (stats.skipped || []).slice(),
+      skipCounts: Object.assign({}, stats.skipCounts || {}),
       maxFiles: opts.maxFiles,
       maxDepth: opts.maxDepth,
       skipSys: opts.skipSys,
@@ -1853,11 +2058,20 @@ async function scanFolder() {
     updateProgress(100);
     scanTableRender.flush();
 
-    $('scanMeta').innerHTML = '扫描完成：共检查 <b>' + stats.scanned + '</b> 个文件，命中 <b>' +
+    var skipN = skipTotal(stats);
+    $('scanMeta').innerHTML = '扫描完成：共遍历 <b>' + stats.scanned + '</b> 个文件，实际检查 <b>' +
+      (stats.checked || 0) + '</b> 个，命中 <b>' +
       stats.hitFiles + '</b> 个文档（<b>' + stats.totalHits + '</b> 处敏感词），耗时 ' + sec + ' 秒' +
+      (stats.detectOnly ? ' · 其中 <b>' + stats.detectOnly + '</b> 个只读格式仅检测（.doc/.rtf/.pdf 需转存为 docx 后处理）' : '') +
+      (stats.nameOnly ? ' · <b>' + stats.nameOnly + '</b> 个正文未读取但文件名含敏感词（检查软件照样报出，需重命名）' : '') +
       (stats.truncated ? ' · 已达文件数上限，结果可能不完整' : '') +
+      (skipN ? ' · <b>' + skipN + '</b> 个未检查（' + skipBreakdown(stats) + '）' : '') +
       (stats.errors ? ' · ' + stats.errors + ' 个文件读取失败' : '');
-    log('文件夹扫描完成：命中 ' + stats.hitFiles + ' 个文档 / ' + stats.totalHits + ' 处敏感词。', 'ok');
+    log('文件夹扫描完成：命中 ' + stats.hitFiles + ' 个文档 / ' + stats.totalHits + ' 处敏感词'
+      + (stats.detectOnly ? '，另有 ' + stats.detectOnly + ' 个只读格式仅检测' : '')
+      + (stats.nameOnly ? '，其中 ' + stats.nameOnly + ' 个仅靠文件名中招（正文未读取，需重命名或人工复核）' : '')
+      + (skipN ? '，' + skipN + ' 个文件未检查（' + skipBreakdown(stats) + '）' : '') + '。',
+      skipN ? 'warn' : 'ok');
   }
 
   /* ---------------- 导入通用检查报告 ---------------- */
@@ -1937,7 +2151,7 @@ async function scanFolder() {
     var engine = buildEngine();
     var targets = [], bigSkip = 0;
     rows.forEach(function (r) {
-      if (!r.handle || !Doc.isSupported(r.path)) return;
+        if (!r.handle || !(Doc.isSupported(r.path) || Doc.isDetectableOnly(r.path))) return;
       if (r.size > MAX_FILE_BYTES) bigSkip++;
       else targets.push(r);
     });
@@ -1961,6 +2175,12 @@ async function scanFolder() {
             var res = Doc.processText(dec.text, engine);
             r.hits = res.hits;
             r.matched = res.matched || [];
+          } else if (Doc.isDetectableOnly(r.path)) {
+            p = Doc.scanBytes(r.path, new Uint8Array(buf), engine).then(function (res) {
+              r.hits = res.hits;
+              r.matched = res.matched || [];
+              if (res.imageOnly) { r.imageOnly = true; r.unreadReason = res.unreadReason; }
+            });
           } else {
             p = Doc.scanOffice(buf, engine).then(function (res) {
               r.hits = res.hits;
@@ -1990,12 +2210,35 @@ async function scanFolder() {
         + '确认命中 ' + realOk + ' 个、误报 ' + fp + ' 个（耗时 ' + ((Date.now() - t1) / 1000).toFixed(1) + ' 秒）。',
         state.importCancel ? 'warn' : 'ok');
     }
+    // 正文没读的行（格式不支持 / 过大 / 未定位）也要按文件名给个结论：
+    // 保密检查软件按「文件名 + 正文」一起检索，名字带密级词就会被开出来。
+    // 以前这些行一律停在「未复检」，用户只能逐条人工核对；真值比对里那几个
+    // 「仅文件名中招」的 PDF / 压缩包就是这么漏掉的。判定不需要读内容，
+    // 能定论的就定论（仍标 detectOnly：正文没看过，不许加入处理列表）。
+    var targetSet = targets.reduce(function (m, r) { m[r.path] = 1; return m; }, {});
+    rows.forEach(function (r) {
+      // 必须有 handle：未定位的行（磁盘上找不到 / 盘符未授权）连文件在不在都不知道，
+      // 报成「确认命中」是凭空造数据；文件名判定只用在确实存在的文件上。
+      if (!r.handle || r.checked || targetSet[r.path] || state.importCancel || !Doc.scanFileName) return;
+      var nm;
+      try { nm = Doc.scanFileName(r.path, engine); } catch (e) { return; }
+      if (!nm || !nm.hits) return;
+      r.hits = nm.hits;
+      r.matched = (nm.matched || []).slice();
+      r.parts = nm.parts || [];
+      r.checked = true;
+      r.nameOnly = true;
+      r.detectOnly = true;
+      r.selected = false;
+    });
     return {
-      // 只认「本工具真的复检过且命中」的行：未复检行（.doc/.pdf 等不支持的格式）
-      // 保留的是检查软件的原始命中数，混进来会把 376 条误报也报成「复检确认命中」
+      // 只认「本工具给出结论且命中」的行：未复检行保留的是检查软件的原始命中数，
+      // 混进来会把误报也报成「确认命中」。文件名中招的行算本工具结论（checked）。
       realHits: rows.filter(function (r) { return r.checked && (r.hits || 0) > 0; }).length,
       totalHits: rows.reduce(function (a, r) { return r.checked ? a + (r.hits || 0) : a; }, 0),
       falsePos: rows.filter(function (r) { return r.checked && !(r.hits > 0); }).length,
+      nameOnly: rows.filter(function (r) { return r.nameOnly; }).length,
+      imageOnly: rows.filter(function (r) { return r.imageOnly; }).length,
       recheckErr: recheckErr,
       bigSkip: bigSkip,
       checked: targets.length,
@@ -2033,7 +2276,7 @@ async function scanFolder() {
     if (!notScanning()) return;
     if (!ensureRules()) return;
     var targets = state.scanResults.filter(function (r) {
-      return r.fromReport && r.handle && Doc.isSupported(r.path);
+      return r.fromReport && r.handle && (Doc.isSupported(r.path) || Doc.isDetectableOnly(r.path));
     });
     if (!targets.length) {
       log('没有可重新甄别的报告行。请先导入检查报告，或确认文件已定位且格式受支持。', 'warn');
@@ -2205,7 +2448,9 @@ async function scanFolder() {
         checkerMatched: f.matched || [],
         // 复检 0 命中的行会被自动取消勾选，避免把检查软件的误报批量处理掉
         selected: false,
-        fromReport: true
+        fromReport: true,
+        // 旧版 .doc/.xls/.ppt：可只读复检，但不能加入处理列表
+        detectOnly: Doc.isDetectableOnly(f.file)
       };
       var dm = /^([A-Za-z]:)[\\/](.*)$/.exec(f.file);
       var driveKey = dm ? dm[1].toUpperCase() : null;
@@ -2226,7 +2471,7 @@ async function scanFolder() {
           // 读全文纯属浪费——大型报告里这类文件占比很高，其中还可能包含数 GB 的
           // 虚拟磁盘镜像，逐个 getFile() 会让定位阶段白等几分钟。
           // 这些行的 size 用报告里带的大小，复检本来也会跳过它们。
-          if (Doc.isSupported(f.file)) {
+          if (Doc.isSupported(f.file) || Doc.isDetectableOnly(f.file)) {
             row.file = await row.handle.getFile();
             if (row.file && row.file.size) row.size = row.file.size;
           }
@@ -2242,7 +2487,7 @@ async function scanFolder() {
       } else {
         noRoot++;
       }
-      if (!Doc.isSupported(f.file)) unsupported++;
+      if (!Doc.isSupported(f.file) && !Doc.isDetectableOnly(f.file)) unsupported++;
       rows.push(row);
     }
     if (aborted) log('定位已中止：剩余 ' + aborted + ' 个文件未定位（已定位的行保留结果，可再次导入继续）', 'warn');
@@ -2259,6 +2504,7 @@ async function scanFolder() {
     var rc = await recheckReportRows(rows, { label: '正在按当前词库复检' });
     var falsePos = rc.falsePos, bigSkip = rc.bigSkip, recheckErr = rc.recheckErr;
     var realHits = rc.realHits;
+    var legacyN = rows.filter(function (r) { return r.detectOnly && !r.imageOnly && !r.nameOnly; }).length;
     state.scanHideFp = falsePos > 0;
 
     rows.forEach(function (r) {
@@ -2280,6 +2526,7 @@ async function scanFolder() {
       skipSys: false,
       truncated: false,
       errors: missing,
+      imageOnly: rc.imageOnly || 0,
       fromReport: true
     };
     scanTableChanged(true);
@@ -2295,11 +2542,14 @@ async function scanFolder() {
       + (missing ? '；磁盘上未找到 ' + missing + ' 个' : '')
       + (aborted ? '；中止时未定位 ' + aborted + ' 个' : '')
       + (dup ? '；重复跳过 ' + dup + ' 个' : '')
-      + (unsupported ? '；' + unsupported + ' 个为暂不支持的格式（.doc/.pdf 等，无法复检、按检查软件原结论列出）' : '')
+      + (rc.imageOnly ? '；' + rc.imageOnly + ' 个扫描件 PDF（无可读文本层，已按只读检测，需人工复核）' : '')
+      + (legacyN ? '；' + legacyN + ' 个只读格式已按只读检测复检（需另存为 docx 后处理）' : '')
+      + (unsupported ? '；' + unsupported + ' 个为暂不支持的格式（.pdf / 压缩包等，无法复检、按检查软件原结论列出）' : '')
       + (bigSkip ? '；' + bigSkip + ' 个文件过大未复检' : '')
       + (recheckErr ? '；' + recheckErr + ' 个复检失败（暂按检查软件原报告处理）' : '') + '。', 'ok');
     if (missing) log('未找到的文件（示例）：' + missSample.join('、') + '，可能已被移动 / 删除、无读取权限，或授权目录不对', 'warn');
-    if (unsupported) log(unsupported + ' 个为 .doc / .pdf 等本工具暂不支持的格式（同样无法复检、按检查软件原结论列出）：请先用 Office / WPS 另存为 .docx / .xlsx / .pptx 再导入处理。', 'info');
+    if (legacyN) log(legacyN + ' 个旧版 .doc / .xls / .ppt 已按只读检测复检（能查敏感词，但不能原地清除）：如需处理，请用 Office / WPS 另存为 .docx / .xlsx / .pptx 再加入处理列表。', 'info');
+    if (unsupported) log(unsupported + ' 个为 .pdf / 压缩包 / 镜像等本工具暂不支持的格式（无法复检、按检查软件原结论列出）：请先转换为可处理格式或人工复核。', 'info');
     if (falsePos) log('复检 0 命中的误报已默认隐藏并取消勾选（表格上方「隐藏误报」可切回），勾选的 ' + realHits
       + ' 个为按当前词库复检确认的命中。', 'info');
     log('勾选后即可「一键处理选中 / 一键删除选中 / 将选中项加入处理列表」。报告文件本身含敏感路径，处理完成后建议删除。', 'info');
@@ -2309,18 +2559,23 @@ async function scanFolder() {
     if (!rows.length) return 0;
     // 定位阶段只对格式支持的文件读内容，未复检 / 不支持的行的 file 为 null；
     // 这些行进处理列表也只会被跳过，直接加会在这行抛「Cannot read properties of null」
-    var usable = rows.filter(function (r) { return r.file; });
+    var usable = rows.filter(function (r) { return r.file && !r.detectOnly; });
     if (!usable.length) {
-      log('选中的 ' + rows.length + ' 行没有可加入处理列表的文件（格式不支持或未定位，处理不了）。', 'warn');
+      var onlyDetect = rows.length && rows.every(function (r) { return r.detectOnly; });
+      log('选中的 ' + rows.length + ' 行没有可加入处理列表的文件'
+        + (onlyDetect ? '：.doc/.xls/.ppt/.rtf/.pdf 只能只读检测，请先转存为 .docx 再处理。'
+          : '（格式不支持或未定位，处理不了）。'), 'warn');
       return 0;
     }
     if (usable.length < rows.length) {
       // 不止说「没加入」，还告诉用户下一步：这类行几乎都是 .doc/.pdf 等二进制格式，
       // 或报告里的路径本机不存在——这两个原因的处置方式完全不同。
       var fmt = rows.filter(function (r) { return !r.file && r.checkerHits > 0 && r.checked; }).length;
+      var legacy = rows.filter(function (r) { return r.detectOnly; }).length;
       log('其中 ' + (rows.length - usable.length) + ' 行未加入处理列表：'
-        + (fmt ? fmt + ' 行格式不支持（.doc / .pdf 等），需先用 Office / WPS 另存为 docx；' : '')
-        + ((rows.length - usable.length - fmt) > 0 ? (rows.length - usable.length - fmt) + ' 行未定位到文件，请检查路径是否存在。' : ''),
+        + (legacy ? legacy + ' 行是只读格式（.doc/.rtf/.pdf/.zip 等，仅检测），需先转存为 .docx；' : '')
+        + (fmt ? fmt + ' 行格式不支持（.rar / .7z / 镜像等），无法处理；' : '')
+        + ((rows.length - usable.length - fmt - legacy) > 0 ? (rows.length - usable.length - fmt - legacy) + ' 行未定位到文件，请检查路径是否存在。' : ''),
         'info');
     }
     usable.forEach(function (r) { r.file._relPath = r.path; });
@@ -2477,13 +2732,18 @@ async function scanFolder() {
     if (!body) return;
     body.innerHTML = '';
     if (!state.scanResults.length) {
+      var skipNoHit = skipTotal(state.lastScan);
       body.innerHTML = '<tr>' + tdEmpty(
-        state.scanAddedCount > 0 ? '命中的都已加入处理列表' : '没有发现敏感词',
-        state.scanAddedCount > 0 ? '已加入的文档在右侧文件列表里' : '扫描范围内的文档都干净',
+        state.scanAddedCount > 0 ? '命中的都已加入处理列表'
+          : (skipNoHit ? '没有发现敏感词，但有文件未检查' : '没有发现敏感词'),
+        state.scanAddedCount > 0 ? '已加入的文档在右侧文件列表里'
+          : (skipNoHit ? skipNoHit + ' 个文件未检查，展开下方「未检查清单」查看原因'
+            : '扫描范围内的文档都干净'),
         'allClear') + '</tr>';
       var wrap0 = $('scanHideFpWrap');
       if (wrap0) wrap0.style.display = 'none';
       updateScanAddBtn();
+      renderScanTally();
       return;
     }
     var rows = scanVisibleRows();
@@ -2491,6 +2751,7 @@ async function scanFolder() {
       body.innerHTML = '<tr>' + tdEmpty('误报都隐藏了', '取消勾选上方「隐藏误报」可查看全部 ' +
         scanFalsePositiveCount() + ' 条', 'filtered') + '</tr>';
       updateScanAddBtn();
+      renderScanTally();
       return;
     }
     rows.forEach(function (r, idx) {
@@ -2500,8 +2761,11 @@ async function scanFolder() {
       var cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.className = 'row-check';
-      cb.checked = r.selected;
-      cb.setAttribute('data-tip', '选择此结果（Shift 连选）');
+      cb.checked = !!r.selected && !r.detectOnly;
+      cb.disabled = !!r.detectOnly;
+      cb.setAttribute('data-tip', r.detectOnly
+        ? '旧版 Office 仅做只读检测，需另存为 .docx 后才能处理'
+        : '选择此结果（Shift 连选）');
       cb.addEventListener('click', function (e) {
         if (e && e.stopPropagation) e.stopPropagation();
         var wantChecked = cb.checked;
@@ -2510,7 +2774,7 @@ async function scanFolder() {
           var lo = Math.min(state.scanLastCheckedIdx, idx);
           var hi = Math.max(state.scanLastCheckedIdx, idx);
           for (var k = lo; k <= hi; k++) {
-            state.scanResults[k].selected = wantChecked;
+            if (!state.scanResults[k].detectOnly) state.scanResults[k].selected = wantChecked;
           }
         } else {
           r.selected = wantChecked;
@@ -2531,14 +2795,20 @@ async function scanFolder() {
           checkerNote = ' <span class="tag" data-tip="本工具复检 ' + r.hits + ' 处 / 保密检查软件报告 ' + r.checkerHits
             + ' 处（检查软件口径更宽，含本工具词库之外的词）">检查软件 ' + r.checkerHits + ' 处</span>';
         } else if (!r.checked) {
-          checkerNote = ' <span class="tag" data-tip="未定位或格式不支持（.doc/.pdf 等），无法按当前词库复检；此处为保密检查软件报告的原始命中数">未复检 ' + r.checkerHits + ' 处</span>';
+      checkerNote = ' <span class="tag" data-tip="未定位或格式不支持（.rar / .7z / 镜像等），无法按当前词库复检；此处为保密检查软件报告的原始命中数">未复检 ' + r.checkerHits + ' 处</span>';
         }
       }
       tr.setAttribute('data-tip', '点击预览此文件的命中情况与处理结果');
       tr.addEventListener('click', function () { selectScanResult(idx); });
       tr.insertAdjacentHTML('beforeend',
         '<td class="path" data-tip="' + escapeHtml(r.path) + '">' + escapeHtml(r.path) + '</td>' +
-        '<td><span class="tag ' + fileKind(r.path) + '">' + kindLabel(fileKind(r.path)) + '</span></td>' +
+        '<td><span class="tag ' + fileKind(r.path) + '">' + kindLabel(fileKind(r.path)) + '</span>'
+        + (r.detectOnly ? ' <span class="tag other" data-tip="' + (r.nameOnly
+            ? '正文未读取（' + escapeHtml(r.unreadReason || '格式不支持') + '），但文件名本身含敏感词，保密检查软件按「文件名 + 正文」检索会报出；需重命名或人工复核'
+            : '该格式只能只读检测（.doc/.rtf/.pdf/.zip 等），不能原地清除；请转存为 .docx 后处理') + '">'
+          + (r.nameOnly ? '仅文件名' : '仅检测') + '</span>' : '')
+        + (r.imageOnly && !r.nameOnly ? ' <span class="tag other" data-tip="扫描件 PDF：无可读文本层（只有图片流），需人工复核或另存为文本格式">扫描件</span>' : '')
+        + '</td>' +
         '<td data-tip="' + (r.totalChars > 0 ? escapeHtml('命中 ' + (r.hitChars || 0) + ' / 全文 ' + r.totalChars + ' 字') : '全文无有效字符') + '">' + fmtRatio(r.ratio) + '</td>' +
         '<td>' + r.hits + ' 处' + checkerNote + (r.residue
           ? ' <span class="tag bad" data-tip="清除后自检仍发现的残留处数">残留 ' + r.residue + '</span>' : '') + '</td>' +
@@ -2549,8 +2819,11 @@ async function scanFolder() {
       var addBtn = document.createElement('button');
       addBtn.type = 'button';
       addBtn.className = 'row-add';
-      addBtn.textContent = '加入';
-      addBtn.setAttribute('data-tip', '把该文档加入处理列表（加入后自动移出扫描结果）');
+      addBtn.textContent = r.detectOnly ? '转存' : '加入';
+      addBtn.disabled = !!r.detectOnly;
+      addBtn.setAttribute('data-tip', r.detectOnly
+        ? '需先用 Office / WPS 另存为 .docx，才能加入处理列表'
+        : '把该文档加入处理列表（加入后自动移出扫描结果）');
       addBtn.addEventListener('click', function (e) {
         if (e && e.stopPropagation) e.stopPropagation();
         if (!addScanRows([r])) log('该文档已在处理列表中：' + r.path, 'warn');
@@ -2598,7 +2871,9 @@ async function scanFolder() {
         + ' data-tip="选中所有命中「' + escapeHtml(w) + '」的 ' + n + ' 行"'
         + ' aria-label="选中所有命中 ' + escapeHtml(w) + ' 的行">' + escapeHtml(w) + '</button>';
     }).join('');
-    return '<td class="words-cell">' + html + '</td>';
+    // 悬停就看出「词在哪个部件」：备注 / 图表 / 文档属性里的密级标识，正文翻不到
+    var tip = hitPartsText(r.parts, 8);
+    return '<td class="words-cell"' + (tip ? ' data-tip="' + escapeHtml(tip) + '"' : '') + '>' + html + '</td>';
   }
 
   /** 当前可见结果里，命中词包含 w 的行数 */
@@ -2612,6 +2887,7 @@ async function scanFolder() {
   function selectScanByWord(w, on) {
     var n = 0;
     scanVisibleRows().forEach(function (x) {
+      if (x.detectOnly) return;
       if ((x.matched || []).indexOf(w) >= 0) {
         x.selected = on;
         n++;
@@ -2624,8 +2900,9 @@ async function scanFolder() {
     var all = $('scanSelAllBox');
     if (!all) return;
     var visible = scanVisibleRows();
-    var total = visible.length;
-    var n = visible.filter(function (r) { return r.selected; }).length;
+    var selectable = visible.filter(function (r) { return !r.detectOnly; });
+    var total = selectable.length;
+    var n = selectable.filter(function (r) { return r.selected; }).length;
     all.checked = total > 0 && n === total;
     all.indeterminate = n > 0 && n < total;
     all.disabled = !total;
@@ -2635,7 +2912,7 @@ async function scanFolder() {
     var btn = $('addScanToFiles');
     if (!btn) return;
     updateScanReportBtn();
-    var n = state.scanResults.filter(function (r) { return r.selected; }).length;
+    var n = state.scanResults.filter(function (r) { return r.selected && !r.detectOnly; }).length;
     btn.textContent = '加入处理列表（' + n + '）';
     btn.disabled = (n === 0);
     var del = $('scanDelSelBtn');
@@ -2649,7 +2926,7 @@ async function scanFolder() {
     var rsBtn = $('scanRescreenBtn');
     if (rsBtn) {
       rsBtn.disabled = state.importing || !state.scanResults.some(function (r) {
-        return r.fromReport && r.handle && Doc.isSupported(r.path);
+        return r.fromReport && r.handle && (Doc.isSupported(r.path) || Doc.isDetectableOnly(r.path));
       });
     }
 
@@ -2676,7 +2953,9 @@ async function scanFolder() {
         size: fmtSize(r.size),
         hits: r.hits,
         matched: (r.matched || []).join(' / '),
-        ratio: fmtRatio(r.ratio)
+        ratio: fmtRatio(r.ratio),
+        mode: r.nameOnly ? '仅文件名' : (r.imageOnly ? '扫描件' : (r.detectOnly ? '仅检测' : '可处理')),
+        parts: hitPartsText(r.parts, 6)
       };
     });
   }
@@ -2698,9 +2977,14 @@ async function scanFolder() {
     var rows = [
       ['生成时间', s.time],
       [s.fromReport ? '导入报告' : '扫描目录', s.root],
-      ['已检查文件数', s.scanned, 'obs', '本次扫描实际读取的文件数'],
+      ['遍历文件数', s.scanned, 'obs', '本次扫描遇到的候选文件总数（含被跳过的）'],
+      ['实际检查文件数', s.checked || s.scanned, 'obs', '真正读取并检索了内容的文件数'],
       ['命中文件数', s.hitFiles, 'obs', '扫描中命中规则的文件数'],
       ['命中词处数', s.totalHits, 'obs', '全部命中位置的总和'],
+      ['仅检测文件数', s.detectOnly || 0, 'obs', '只读格式（.doc/.rtf/.pdf/.zip 等）检测命中数（不能原地清除，需转存为 docx）'],
+      ['扫描件 PDF 数', s.imageOnly || 0, 'obs', '图片型 PDF（无文本层）数：无法按文本检索敏感词，需人工复核或另存为文本格式'],
+      ['仅文件名命中数', s.nameOnly || 0, 'obs', '正文未读取（格式不支持 / 超大 / 读不动）但文件名含敏感词的命中数；检查软件按「文件名 + 正文」检索照样报出，需重命名或人工复核'],
+      ['未检查文件数', skipTotal(s), 'obs', skipBreakdown(s) || '本次遇到的候选文件均已检查'],
       ['平均命中占比', fmtRatio(scanArchiveRatio()), 'der', '全部命中文件按文件加权的平均占比，回答这批文件整体有多涉密'],
       ['文件数上限', s.maxFiles, 'obs', '本次扫描的设置值'],
       ['最大深度', s.maxDepth],
@@ -2725,16 +3009,22 @@ async function scanFolder() {
     if (!state.lastScan || !state.scanArchive.length) { log('还没有可导出的扫描结果', 'warn'); return; }
     // 直接取 scanArchive 原始行：matched 是数组（scanReportRows() 已 join 成字符串，给 CSV 用）
     var rows = state.scanArchive.map(function (r) {
-      return { file: r.path, hits: r.hits, matched: r.matched || [], status: r.checked ? (r.hits ? 'hit' : 'clean') : 'pending', ratio: fmtRatio(r.ratio) };
+      var st = 'hit';
+      if (r.detectOnly) st = 'detect';
+      else if (r.fromReport) st = r.checked ? (r.hits ? 'hit' : 'clean') : 'pending';
+      return { file: r.path, hits: r.hits, matched: r.matched || [], status: st, ratio: fmtRatio(r.ratio), parts: hitPartsText(r.parts, 6) };
     });
     var s0 = state.lastScan;
-    var concl = '本次扫描按当前词库检查了 ' + s0.scanned + ' 个文件，其中 ' + s0.hitFiles + ' 个命中、共 ' + s0.totalHits + ' 处。';
+    var concl = '本次扫描按当前词库检查了 ' + (s0.checked || s0.scanned) + ' 个文件，其中 ' + s0.hitFiles + ' 个命中、共 ' + s0.totalHits + ' 处。';
+    if (s0.detectOnly) concl += '另有 ' + s0.detectOnly + ' 个旧版 Office 文件仅做只读检测，需另存为 .docx 后才能清除。';
     concl += s0.hitFiles ? '建议勾选命中文件后点「一键处理选中」清理，或导出本报告留档。' : '未发现敏感词；重要文件仍建议人工复核后分发。';
     // v3.9 动态局限：只把本次真实发生的情况写进报告（参照 REA 的 truncation()）
     var extraLimits = [];
     if (s0.truncated) extraLimits.push('本次扫描已达到文件数上限（' + s0.maxFiles + '），未检查的文件不在本报告内。');
     if (s0.errors) extraLimits.push('有 ' + s0.errors + ' 个文件读取失败，其内容未纳入本次检查。');
     if (s0.skipSys) extraLimits.push('已跳过系统与依赖文件夹（如 node_modules、.git），其中的文件未检查。');
+    var skipN = skipTotal(s0);
+    if (skipN) extraLimits.push('有 ' + skipN + ' 个文件未检查（' + skipBreakdown(s0) + '），明细见「导出未检查清单」。');
     var steps = [
       '按当前词库对文件全文做归一化匹配（剔除零宽字符、折叠全角与空格、容忍符号插字与繁体写法）。',
       'Word / Excel / PPT 直接改写内部 XML，覆盖正文、页眉页脚、脚注批注、文本框与元数据。',
@@ -2752,6 +3042,7 @@ async function scanFolder() {
         { k: 'ratio', label: '命中占比', width: '70px' },
         { k: 'hits', label: '命中处数', width: '70px' },
         { k: 'matched', label: '命中词' },
+        { k: 'parts', label: '命中位置' },
         { k: 'status', label: '状态', width: '80px' }
       ],
       steps: steps,
@@ -2980,7 +3271,7 @@ async function scanFolder() {
 
   /** 当前勾选、且带目录 / 文件句柄（来自「扫描文件夹」）的命中行 */
   function selectedScanTargets() {
-    return state.scanResults.filter(function (r) { return r.selected && r.handle; });
+    return state.scanResults.filter(function (r) { return r.selected && r.handle && !r.detectOnly; });
   }
 
   /** 一键处理选中：清理命中文档并写回原位置（默认先备份 .bak，受「输出方式 · 备份」开关控制） */
@@ -3387,7 +3678,7 @@ async function scanFolder() {
   }
 
   /** 在预览标题处展示命中词徽章 */
-  function renderPreviewHits(matched) {
+  function renderPreviewHits(matched, parts) {
     var box = $('previewHits');
     if (!box) return;
     box.innerHTML = '';
@@ -3398,6 +3689,31 @@ async function scanFolder() {
       s.setAttribute('data-tip', '命中的敏感词：' + m);
       box.appendChild(s);
     });
+    var txt = hitPartsText(parts, 12);
+    if (txt) {
+      var where = document.createElement('div');
+      where.className = 'hit-parts';
+      where.textContent = '命中位置：' + txt;
+      box.appendChild(where);
+    }
+  }
+
+  /** 命中位置一句话：「备注（ppt/notesSlides/notesSlide1.xml）× 2 处：内部」。
+   *  密级标识常常写在备注页 / 图表 / 文档属性 / 形状名 / 内嵌对象里，正文里翻不到——
+ *  只报「命中 3 处：内部」，用户会以为工具在胡说（v4.80）。 */
+  function hitPartsText(parts, max) {
+    var list = (parts || []).filter(function (p) { return p && p.hits > 0; });
+    if (max && list.length > max) {
+      return list.slice(0, max).map(partText).join('；')
+        + '；等 ' + list.length + ' 个部位';
+    }
+    return list.map(partText).join('；');
+  }
+
+  function partText(p) {
+    var lb = p.label || (Doc.partLabel ? Doc.partLabel(p.name) : '') || p.name || '未知部位';
+    var where = (p.name && p.name !== lb) ? ('（' + p.name + '）') : '';
+    return lb + where + ' × ' + p.hits + ' 处：' + (p.matched || []).join('、');
   }
 
   function selectFile(id) {
@@ -3411,7 +3727,7 @@ async function scanFolder() {
     if (!it) return;
     setPreviewName(it.path);
     it.file.arrayBuffer().then(function (buf) {
-      renderPreviewSource(it.path, buf);
+      renderPreviewSource(it.path, buf, it.parts);
     }).catch(function (e) {
       previewFailed(e);
     });
@@ -3445,7 +3761,7 @@ async function scanFolder() {
     return body;
   }
 
-  function renderPreviewSource(path, buf) {
+  function renderPreviewSource(path, buf, parts) {
     $('previewOrig').textContent = '加载中…';
     $('previewNew').textContent = '';
     setPreviewNote('');
@@ -3465,7 +3781,7 @@ async function scanFolder() {
       if ($('tidySpace').checked) effective.text = Rules.tidy(effective.text);
       var body = previewBody(effective.text);
       state.lastPreview = body;
-      renderPreviewHits(effective.matched);
+      renderPreviewHits(effective.matched, parts);
       previewNoteFor(effective !== res, res.hits, effective.hits);
       var cb1 = $('copyResultBtn'); if (cb1) cb1.disabled = false;
       $('previewNew').textContent = body ||
@@ -3482,7 +3798,7 @@ async function scanFolder() {
       $('previewOrig').innerHTML = highlightOffice(ex.text, effective, hlEngine, PREVIEW_MAX);
       var body = previewBody(effective.text);
       state.lastPreview = body;
-      renderPreviewHits(effective.matched);
+      renderPreviewHits(effective.matched, parts);
       previewNoteFor(effective !== idx, idx.hits, effective.hits);
       var cb2 = $('copyResultBtn'); if (cb2) cb2.disabled = false;
       $('previewNew').textContent = body ||
@@ -3508,14 +3824,14 @@ async function scanFolder() {
     var r = null;
     if (state.scanPreviewIdx >= 0) r = scanVisibleRows()[state.scanPreviewIdx];
     if (r && r.file) {
-      r.file.arrayBuffer().then(function (b) { renderPreviewSource(r.path, b); })
+      r.file.arrayBuffer().then(function (b) { renderPreviewSource(r.path, b, r.parts); })
         .catch(function () { /* 预览刷新失败不改动界面 */ });
       return;
     }
     if (state.selectedId != null) {
       var it = state.files.filter(function (x) { return x.id === state.selectedId; })[0];
       if (it) {
-        it.file.arrayBuffer().then(function (b) { renderPreviewSource(it.path, b); })
+        it.file.arrayBuffer().then(function (b) { renderPreviewSource(it.path, b, it.parts); })
           .catch(function () { /* 预览刷新失败不改动界面 */ });
         return;
       }
@@ -3529,16 +3845,39 @@ async function scanFolder() {
    */
   function selectScanResult(idx) {
     var r = scanVisibleRows()[idx];
-    if (!r || !r.file) return;
+    if (!r || (!r.file && !r.nameOnly)) return;
     state.scanPreviewIdx = idx;
     renderScanResults();
     syncTaskUi();
     setPreviewName(r.path);
+    // 仅文件名中招：正文压根没读，能给的只有「哪个词在文件名的哪个位置」。
+    // 不给这一屏，用户点行毫无反应，只会以为工具坏了。
+    if (r.nameOnly) {
+      $('previewOrig').textContent = '（正文未读取：' + (r.unreadReason || '格式不支持') + '）';
+      $('previewNew').textContent = '';
+      renderPreviewHits(r.matched || [], r.parts);
+      setPreviewNote('该文件的敏感词出现在文件名里，本工具没有读取正文（' + (r.unreadReason || '格式不支持') + '）。'
+        + '保密检查软件按「文件名 + 正文」一起检索，因此仍会把它报出来。'
+        + '请重命名文件（改名会影响引用，工具不代做），或人工复核正文后再定去留。');
+      var cbName = $('copyResultBtn');
+      if (cbName) cbName.disabled = true;
+      return;
+    }
+    if (r.detectOnly) {
+      $('previewOrig').textContent = '（旧版 Office 二进制格式，仅支持只读检测，无法预览改写结果）';
+      $('previewNew').textContent = '';
+      renderPreviewHits(r.matched || [], r.parts);
+      setPreviewNote('该文件为旧版 .doc / .xls / .ppt：本工具已按只读方式检出敏感词，但不能原地清除。'
+        + '请用 Office / WPS 另存为 .docx / .xlsx / .pptx 后再加入处理列表。');
+      var cbDetect = $('copyResultBtn');
+      if (cbDetect) cbDetect.disabled = true;
+      return;
+    }
     // 扫描表可能很长，预览面板在表格下方：点行后把它带入视野
     var card = $('previewCard');
     if (card && card.scrollIntoView) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     r.file.arrayBuffer().then(function (buf) {
-      renderPreviewSource(r.path, buf);
+      renderPreviewSource(r.path, buf, r.parts);
     }).catch(function (e) { previewFailed(e); });
   }
 
@@ -4626,8 +4965,17 @@ async function scanFolder() {
     // v4.68 合计行数字点击筛选：与上方状态下拉同一套状态，两处入口双向同步
     var scanTallyEl = $('scanTally');
     if (scanTallyEl) scanTallyEl.addEventListener('click', function (e) {
-      var b = e.target && e.target.closest ? e.target.closest('b[data-st]')
-        : (e.target && e.target.getAttribute && e.target.getAttribute('data-st') ? e.target : null);
+      // 先认「未检查清单」按钮，再认状态筛选数字：两者都是裸 <b>，顺序反了会互相抢占
+      var t = e.target || {};
+      var b = t.closest ? t.closest('b[data-st]')
+        : (t.getAttribute && t.getAttribute('data-st') ? t : null);
+      var sk = e.target && e.target.closest ? e.target.closest('b[data-skip]')
+        : (e.target && e.target.getAttribute && e.target.getAttribute('data-skip') ? e.target : null);
+      if (sk && !b) {
+        var wrap = $('scanSkippedWrap');
+        if (wrap) wrap.open = !wrap.open;
+        return;
+      }
       if (!b) return;
       var st = b.getAttribute('data-st');
       state.scanFilterStatus = (state.scanFilterStatus === st) ? 'all' : st;

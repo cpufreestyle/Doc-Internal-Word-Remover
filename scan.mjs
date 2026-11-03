@@ -70,6 +70,9 @@ const DOC_EXT = [
   'docx', 'docm', 'dotx', 'dotm',
   'xlsx', 'xlsm', 'xltx', 'xltm',
   'pptx', 'pptm', 'potx', 'potm', 'ppsx', 'ppsm',
+  'doc', 'xls', 'ppt',
+  'pdf',
+  'zip',
   'txt', 'text', 'md', 'markdown', 'rst', 'csv', 'tsv'
 ];
 function isDocFile(name) {
@@ -211,7 +214,7 @@ function pickReportFiles(list, o) {
 }
 
 async function loadEngine() {
-  const files = ['js/zip.js', 'js/rules.js', 'js/ooxml.js', 'js/util.js', 'js/report.js'];
+  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js', 'js/report.js'];
   const code = files
     .map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8'))
     .join('\n');
@@ -238,7 +241,10 @@ function parseArgs(argv) {
     else if (a === '--clean') o.clean = true;
     else if (a === '--json') o.json = true;
     else if (a === '--limit') o.limit = parseInt(argv[++i], 10) || Infinity;
-    else if (a === '--depth') o.depth = parseInt(argv[++i], 10) || Infinity;
+    else if (a === '--depth') {
+      const depth = parseInt(argv[++i], 10);
+      o.depth = Number.isFinite(depth) && depth >= 0 ? depth : Infinity;
+    }
     else if (a === '--no-skip-system') o.skipSystem = false;
     else if (a === '--docs-only') o.docsOnly = true;
     else if (a === '--concurrency') o.concurrency = parseInt(argv[++i], 10) || 8;
@@ -420,11 +426,27 @@ function posLabel(firstHit, lastHit) {
  * 共用同一份实现」——命令行报告因此拿不到公式注入防护，只有网页端有。
  */
 function toCsv(results, csvFn) {
-  const lines = ['file,hits,matched,pos,ratio'];
+  const lines = ['file,hits,matched,pos,ratio,parts'];
   results.forEach((r) => lines.push([
-    r.file, r.hits, (r.matched || []).join(' / '), posLabel(!!r.firstHit, !!r.lastHit), r.ratio ? (r.ratio * 100).toFixed(2) + '%' : ''
+    r.file, r.hits, (r.matched || []).join(' / '),
+    r.nameOnly ? '仅文件名' : (r.detectOnly ? '仅检测' : posLabel(!!r.firstHit, !!r.lastHit)),
+    r.ratio ? (r.ratio * 100).toFixed(2) + '%' : '', partsText(r.parts)
   ].map(csvFn).join(',')));
   return lines.join('\r\n') + '\r\n';
+}
+
+/** 命中位置一句话：备注 / 图表 / 文档属性 / 内嵌对象里的密级标识，正文里翻不到，
+ *  只报「命中 3 处：内部」用户会以为工具在胡说（v4.79）。 */
+function partsText(parts, max) {
+  const list = (parts || []).filter((p) => p && p.hits > 0);
+  const cap = max || 6;
+  const one = (p) => {
+    const lb = p.label || (D.DWRDoc.partLabel ? D.DWRDoc.partLabel(p.name) : '') || p.name || '未知部位';
+    const where = (p.name && p.name !== lb) ? '（' + p.name + '）' : '';
+    return lb + where + ' × ' + p.hits + ' 处：' + (p.matched || []).join('、');
+  };
+  if (list.length > cap) return list.slice(0, cap).map(one).join('；') + '；等 ' + list.length + ' 个部位';
+  return list.map(one).join('；');
 }
 
 function fmtTime(d) {
@@ -472,10 +494,12 @@ function buildRules(D, o) {
   } else {
     rules = D.DWRRules.DEFAULT_PRESETS.map((p) => ({
       text: p.word, type: 'text', enabled: true,
-      notBefore: p.notBefore, notAfter: p.notAfter, whole: p.whole, group: p.group
+      notBefore: p.notBefore, notAfter: p.notAfter, whole: p.whole, group: p.group,
+      docNumber: p.docNumber
     }));
   }
   if (o.whole) rules.forEach((r) => { r.whole = true; });
+  // --words 是用户显式给的裸词：不套用文号的括号年份要求，用户要什么就查什么
   if (o.excludeCtx.length) rules.forEach((r) => {
     r.notBefore = (r.notBefore || []).concat(o.excludeCtx);
     r.notAfter = (r.notAfter || []).concat(o.excludeCtx);
@@ -525,15 +549,23 @@ function renderHtmlReport(opts) {
       '<td class="c-file"><a class="fname" href="' + escapeHtml(fileUrl(r.file)) + '" title="点击打开文件">' + escapeHtml(name) + '</a>' +
       '<div class="fpath">' + escapeHtml(r.file) + '</div></td>' +
       '<td class="c-type">' + escapeHtml(typeLabel(r.file)) + '</td>' +
-      '<td class="c-pos">' + posLabel(!!r.firstHit, !!r.lastHit) + '</td>' +'<td class="c-ratio">' + (r.ratio ? (r.ratio * 100).toFixed(1) + '%' : '-') + '</td>' +
+      '<td class="c-pos">' + (r.nameOnly ? '仅文件名' : (r.detectOnly ? '仅检测' : posLabel(!!r.firstHit, !!r.lastHit))) + '</td>' +'<td class="c-ratio">' + (r.ratio ? (r.ratio * 100).toFixed(1) + '%' : '-') + '</td>' +
       '<td class="c-words">' + escapeHtml((r.matched || []).join('、')) + '</td>' +
+      '<td class="c-parts">' + escapeHtml(partsText(r.parts, 4)) + '</td>' +
       '<td class="c-dir"><a href="' + escapeHtml(dirUrl) + '" title="打开所在目录">目录</a></td>' +
       '</tr>';
   }).join('');
 
   const body = nFiles
-    ? '<table><thead><tr><th class="c-no">#</th><th>文件</th><th class="c-type">类型</th><th class="c-pos">位置</th><th class="c-ratio">命中占比</th><th class="c-words">命中字样</th><th class="c-dir">目录</th></tr></thead><tbody>' + tableRows + '</tbody></table>'
+    ? '<table><thead><tr><th class="c-no">#</th><th>文件</th><th class="c-type">类型</th><th class="c-pos">位置</th><th class="c-ratio">命中占比</th><th class="c-words">命中字样</th><th class="c-parts">命中位置</th><th class="c-dir">目录</th></tr></thead><tbody>' + tableRows + '</tbody></table>'
     : '<p class="empty">未发现「首行 / 尾行」含目标字样的文档。</p>';
+
+  const scanned = opts.scannedPdfs || [];
+  const scannedBlock = scanned.length
+    ? '<section class="scanned"><h2>扫描件 PDF（' + scanned.length + ' 个，需人工复核）</h2>'
+      + '<p class="hint">这些文件没有可读文本层（内容流里只有图片），本工具不做 OCR，无法按文本检索敏感词。请人工打开核对，或另存为可检索的文本格式后重新扫描。</p>'
+      + '<ul>' + scanned.map((p) => '<li><a class="fname" href="' + escapeHtml(fileUrl(p)) + '">' + escapeHtml(path.basename(p)) + '</a><span class="fpath">' + escapeHtml(p) + '</span></li>').join('') + '</ul></section>'
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -567,15 +599,20 @@ function renderHtmlReport(opts) {
   .c-pos{width:92px;color:var(--ink2);font-size:12.5px;white-space:nowrap}
   .c-ratio{width:76px;color:var(--ink2);font-size:12.5px;white-space:nowrap;font-variant-numeric:tabular-nums}
   .c-words{width:150px}
+  .c-parts{width:190px;color:var(--ink2);font-size:12px;word-break:break-all}
   .c-dir{width:56px;text-align:right}
   .fname{color:var(--ink);font-weight:550;text-decoration:underline;text-decoration-thickness:1px;text-decoration-color:var(--hair2);text-underline-offset:3px}
   .fpath{display:block;font:11.5px/1.55 var(--mono);color:var(--ink3);margin-top:4px;word-break:break-all}
   .c-dir a{color:var(--ink2);text-decoration:underline;text-decoration-thickness:1px;text-decoration-color:var(--hair2);text-underline-offset:3px;font-size:12.5px}
   .empty{padding:44px 0;color:var(--ink2);border-bottom:1px solid var(--hair);margin:0}
+  .scanned{margin-top:48px;padding-top:24px;border-top:1.5px solid var(--ink)}
+  .scanned h2{font-size:18px;font-weight:600;margin:0 0 6px}
+  .scanned ul{list-style:none;padding:0;margin:18px 0 0}
+  .scanned li{padding:10px 0;border-bottom:1px solid var(--hair)}
   footer{margin-top:56px;padding-top:18px;border-top:1px solid var(--hair2);color:var(--ink3);font-size:12.5px;line-height:1.9}
   .foot-meta{font:11.5px/1.9 var(--mono);color:var(--ink3)}
   @media (max-width:760px){
-    .c-type,.c-words{display:none}
+    .c-type,.c-words,.c-parts{display:none}
     .wrap{padding-left:20px;padding-right:20px}
   }
 </style>
@@ -591,9 +628,10 @@ function renderHtmlReport(opts) {
     <div><dt>扫描范围</dt><dd>${opts.targets.map((t) => escapeHtml(t)).join('<br>')}</dd></div>
     <div><dt>目标字样</dt><dd>${wordListHtml(opts)}</dd></div>
     <div><dt>匹配范围</dt><dd>${escapeHtml(scopeLabel)}</dd></div>
-    <div><dt>结果</dt><dd><span class="num">${nFiles}</span> 个文件 · <span class="num">${nHits}</span> 处命中<br>扫描 <span class="num">${opts.scanned}</span> 个文件 · ${escapeHtml(opts.sec)} 秒</dd></div>
+    <div><dt>结果</dt><dd><span class="num">${nFiles}</span> 个文件 · <span class="num">${nHits}</span> 处命中<br>扫描 <span class="num">${opts.scanned}</span> 个文件 · ${escapeHtml(opts.sec)} 秒${scanned.length ? '<br>扫描件 PDF <span class="num">' + scanned.length + '</span> 个（需人工复核）' : ''}</dd></div>
   </dl>
   ${body}
+  ${scannedBlock}
   <footer>
     <p>本清单为只读扫描结果，未修改任何原始文件。文件链接为本地路径（file:///），在浏览器中点击即可打开或下载；点击「目录」可在浏览器中查看该文件夹内容。</p>
     <p class="foot-meta">${typeText ? '类型分布：' + escapeHtml(typeText) : ''}<br>Doc-Internal-Word-Remover · scan.mjs · 与 JSON / CSV 报告同源，可复核</p>
@@ -641,6 +679,16 @@ async function main() {
       } else {
         r = await D.DWRDoc.verifyBytes(u8, eng);
       }
+      // 输出文件名同样会被检查软件检索：正文清了但输出还叫「机密合同.docx」，等于白做。
+      // 本工具不替用户改名（改名会影响引用与链接），所以这里必须单独说清楚原因。
+      const nm = D.DWRDoc.scanFileName(full, eng);
+      const nameNote = nm.hits ? '（输出文件名本身含敏感词：' + nm.matched.join('、') + '，需重命名）' : '';
+      if (nm.hits) {
+        r = r || { hits: 0, matched: [], parts: [] };
+        r.hits += nm.hits;
+        nm.matched.forEach((w) => { if (r.matched.indexOf(w) < 0) r.matched.push(w); });
+        r.parts = (r.parts || []).concat(nm.parts);
+      }
       verifyState.files++;
       if (r && r.hits > 0) {
         verifyState.dirty++;
@@ -648,7 +696,7 @@ async function main() {
         const where = r.parts && r.parts.length
           ? '；位置: ' + r.parts.map((pp) => pp.name + '(' + pp.hits + ')').join('、')
           : '';
-        console.log('[残留 ' + r.hits + '] ' + full + ' => ' + (r.matched || []).join('、') + where);
+        console.log('[残留 ' + r.hits + '] ' + full + ' => ' + (r.matched || []).join('、') + where + nameNote);
       }
     } catch (e) { verifyState.fail++; }
   }
@@ -787,12 +835,16 @@ async function main() {
     const mapPool = (D.DWRUtil && D.DWRUtil.mapPool) ? D.DWRUtil.mapPool
       : (items, limit, fn) => Promise.all(items.map((it, i) => fn(it, i)));
 
-    let done = 0, totalHits = 0, fail = 0, skip = 0, finished = 0, unsupported = 0, clamped = 0;
+    let done = 0, totalHits = 0, fail = 0, skip = 0, finished = 0, unsupported = 0, clamped = 0, legacyOnly = 0;
     let deleted = 0, deleteFail = 0, deleteBlocked = 0, missing = 0, bakCount = 0, bakFail = 0, planned = 0;
 
     await mapPool(list, conc, async (item) => {
       try {
-        if (!D.DWRDoc.isSupported(item.file)) { unsupported++; return; }
+        if (!D.DWRDoc.isSupported(item.file)) {
+          // 旧版 Office 可只读检测，但报告清理模式要写回内容——做不到，单独计数并提示转存
+          if (D.DWRDoc.isDetectableOnly(item.file)) legacyOnly++; else unsupported++;
+          return;
+        }
         let st;
         try { st = await fsp.stat(item.file); } catch (eS) {
           missing++;
@@ -934,7 +986,8 @@ async function main() {
     if (bakFail) console.log('备份未清理  : ' + bakFail + ' 个（含敏感原文，请手工删除）');
     if (skippedBig) console.log('超大已跳过  : ' + skippedBig + ' 个（超过 ' + Math.round(MAX_FILE_BYTES / 1048576) + 'MB，可用 --max-file-mb 调整）');
     if (skippedEmpty) console.log('空文件跳过  : ' + skippedEmpty + ' 个（网络盘读到 0 字节，多为同步中或被占用）');
-    if (unsupported) console.log('不支持格式  : ' + unsupported + ' 个（.doc/.pdf 等二进制格式，需先用 Office/WPS 另存为 docx 再处理）');
+    if (legacyOnly) console.log('旧版仅检测  : ' + legacyOnly + ' 个（.doc/.xls/.ppt 无法原地清除，需先用 Office/WPS 另存为 docx/xlsx/pptx 再处理）');
+    if (unsupported) console.log('不支持格式  : ' + unsupported + ' 个（.rar / .7z / 镜像等无法解包，需人工复核）');
     if (clamped) console.log('路径越界    : ' + clamped + ' 个（镜像基准与报告层级不符，副本已改写到 --out 之内）');
     if (o.out) console.log('输出目录    : ' + o.out);
     if (!o.inPlace && !o.delete) console.log('（原始文件未被修改）');
@@ -1059,9 +1112,42 @@ async function main() {
     } catch (e) { /* 落盘失败不影响扫描 */ }
   }
   let scanned = 0, hitFiles = 0, totalHits = 0, fail = 0, movedCount = 0, moveFailCount = 0, deleteCount = 0, deleteFailCount = 0, cleanFailCount = 0, cleanClampCount = 0;
+  let detectOnlyCount = 0; // v4.79 旧版 .doc/.xls/.ppt 只读检测命中数（不参与剪切 / 删除）
+  let imageOnlyCount = 0;  // 扫描件 PDF（无文本层）总数，含 0 命中的
+  const imageOnlyFiles = []; // 供控制台与 HTML 清单列路径
   let dirFailCount = 0, statFailCount = 0;
   let nameSkipped = 0;  // v4.7 因文件名不匹配而跳过的文件数
   let extSkipped = 0;   // v4.67 因格式不在支持清单而跳过的文件数（图片/.doc/.pdf 等）
+  let nameOnlyCount = 0; // v4.81 正文没读（格式不支持 / 超大 / 读不动）但文件名含敏感词的命中文件数
+
+  /**
+   * 「只靠文件名就中招」的文件（v4.81）。
+   *   保密检查软件按「文件名 + 正文」一起检索，所以 .pdf / 压缩包 / 超大文件这类
+   *   本工具读不动正文的东西，只要名字里带密级词照样会被开出来。以前它们在格式
+   *   门槛处就 continue 掉了，用户看到「命中 0」以为全盘干净，下次检查原样中招。
+   *   这里补上文件名判定：计入命中，但标记「仅文件名」，不执行剪切 / 删除
+   *   （改名会影响引用，工具不代做；正文也确实没看过）。
+   * @returns {boolean} 是否已作为命中记录（调用方据此仍要计入未检查计数）
+   */
+  function nameOnlyHit(full, why) {
+    if (o.clean) return false; // 脱敏模式只报正文改动，改名由用户决定
+    let nm;
+    try { nm = D.DWRDoc.scanFileName(full, engine); } catch (e) { return false; }
+    if (!nm || !nm.hits) return false;
+    nameOnlyCount++;
+    hitFiles++;
+    totalHits += nm.hits;
+    results.push({
+      file: full, hits: nm.hits, hitChars: nm.hitChars || 0, totalChars: nm.totalChars || 0,
+      ratio: nm.totalChars > 0 ? (nm.hitChars || 0) / nm.totalChars : 0,
+      matched: nm.matched, parts: nm.parts || [],
+      detectOnly: true, nameOnly: true, unreadReason: why,
+    });
+    console.log('[命中 ' + nm.hits + '][仅文件名] ' + full
+      + '\n       词: ' + nm.matched.join('、')
+      + '\n       正文未读取（' + why + '），仅文件名含敏感词，需重命名或人工复核');
+    return true;
+  }
 
   async function processOne(full) {
     // v4.3 零复制：直接用 Buffer 底层 ArrayBuffer。此前 slice 一份等于双倍占用，
@@ -1069,8 +1155,27 @@ async function main() {
     const buf = await fsp.readFile(full);
     // 网络盘一致性：readdir 有记录但 readFile 拿到 0 字节（文件在同步 / 被占用）是常态，
     // 直接跳过而不是送进 ZIP 解析刷噪音。
-    if (!buf || !buf.length) { skippedEmpty++; return { hits: 0, hitChars: 0, totalChars: 0, ratio: 0, matched: [], firstHit: false, lastHit: false, touched: false, outAb: null, outBuf: null }; }
+    if (!buf || !buf.length) {
+      skippedEmpty++;
+      nameOnlyHit(full, '读到 0 字节');
+      return { hits: 0, hitChars: 0, totalChars: 0, ratio: 0, matched: [], firstHit: false, lastHit: false, touched: false, outAb: null, outBuf: null };
+    }
     const ab = buf.buffer;
+
+    // 文件名也计入命中：保密检查软件按「文件名 + 正文」一起检索，
+    // 名为「机密合同.docx」的文件正文再干净也会被报出。只读扫描必须如实说出来，
+    // 否则用户以为处理完了，下次检查照样中招。
+    const nameHit = (res) => {
+      if (o.clean) return res; // 脱敏模式只报正文改动，改名由用户决定
+      const nm = D.DWRDoc.scanFileName(full, engine);
+      if (!nm.hits) return res;
+      res.hits += nm.hits;
+      res.hitChars = (res.hitChars || 0) + nm.hitChars;
+      res.totalChars = (res.totalChars || 0) + nm.totalChars;
+      nm.matched.forEach((w) => { if (res.matched.indexOf(w) < 0) res.matched.push(w); });
+      res.parts = (res.parts || []).concat(nm.parts);
+      return res;
+    };
 
     if (D.DWRDoc.isOfficeFile(full)) {
       if (o.clean) {
@@ -1078,14 +1183,22 @@ async function main() {
         const outAb = res.touched && res.blob ? await res.blob.arrayBuffer() : null;
         return { hits: res.hits, hitChars: res.hitChars || 0, totalChars: res.totalChars || 0, ratio: res.ratio || 0, matched: res.matched, firstHit: res.firstHit, lastHit: res.lastHit, touched: res.touched, outAb, outBuf: null };
       }
-      const scan = await D.DWRDoc.scanOffice(ab, engine);
-      return { hits: scan.hits, hitChars: scan.hitChars || 0, totalChars: scan.totalChars || 0, ratio: scan.ratio || 0, matched: scan.matched, firstHit: scan.firstHit, lastHit: scan.lastHit, touched: scan.hits > 0, outAb: null, outBuf: null };
+      const scan = nameHit(await D.DWRDoc.scanOffice(ab, engine));
+      return { hits: scan.hits, hitChars: scan.hitChars || 0, totalChars: scan.totalChars || 0, ratio: scan.ratio || 0, matched: scan.matched, parts: scan.parts || [], firstHit: scan.firstHit, lastHit: scan.lastHit, touched: scan.hits > 0, outAb: null, outBuf: null };
+    }
+
+    // 旧版 OLE2（doc/xls/ppt）：只读检测，能查敏感词但不能原地清除
+    // 只读检测档（旧版 OLE2 与 RTF）：能查敏感词但不能原地清除
+    if (D.DWRDoc.isDetectableOnly(full)) {
+      const scan = nameHit(await D.DWRDoc.scanBytes(full, buf, engine));
+      return { hits: scan.hits, hitChars: 0, totalChars: 0, ratio: 0, matched: scan.matched, parts: scan.parts || [], firstHit: false, lastHit: false, touched: scan.hits > 0, outAb: null, outBuf: null, detectOnly: true, imageOnly: !!scan.imageOnly, unreadReason: scan.unreadReason };
     }
 
     const dec = D.DWRDoc.decodeText(buf);
     const r = D.DWRDoc.processText(dec.text, engine, dec.encoding);
     const outBuf = o.clean && r.touched ? D.DWRDoc.encodeText(r.text, dec.bom, dec.encoding) : null;
-    return { hits: r.hits, hitChars: r.hitChars || 0, totalChars: r.totalChars || 0, ratio: r.ratio || 0, matched: r.matched, firstHit: r.firstHit, lastHit: r.lastHit, touched: r.touched, outAb: null, outBuf };
+    const textRes = { hits: r.hits, hitChars: r.hitChars || 0, totalChars: r.totalChars || 0, ratio: r.ratio || 0, matched: r.matched, parts: (r.touched || r.hits > 0) ? [{ name: '（全文）', label: '（全文）', hits: r.hits, matched: r.matched.slice() }] : [], firstHit: r.firstHit, lastHit: r.lastHit, touched: r.touched, outAb: null, outBuf };
+    return nameHit(textRes);
   }
 
   // 有界队列流式扫描：目录遍历与文档处理并发进行，内存占用恒定、不随文件总数增长
@@ -1163,6 +1276,7 @@ async function main() {
         info = await processOne(full);
       } catch (e) {
         fail++;
+        nameOnlyHit(full, '读取失败');
         console.log('[错误] ' + full + ' => ' + (e && e.message ? e.message : e));
         continue;
       }
@@ -1189,13 +1303,24 @@ async function main() {
         }
         await verifyOut(full, buf);
       }
+      if (info.imageOnly) {
+        imageOnlyCount++;
+        if (imageOnlyFiles.length < 200) imageOnlyFiles.push(full);
+      }
       if (info.hits > 0) {
         hitFiles++;
         totalHits += info.hits;
-        const entry = { file: full, hits: info.hits, hitChars: info.hitChars || 0, totalChars: info.totalChars || 0, ratio: info.ratio || 0, matched: info.matched, firstHit: !!info.firstHit, lastHit: !!info.lastHit };
+        const entry = { file: full, hits: info.hits, hitChars: info.hitChars || 0, totalChars: info.totalChars || 0, ratio: info.ratio || 0, matched: info.matched, parts: info.parts || [], firstHit: !!info.firstHit, lastHit: !!info.lastHit };
+        if (info.detectOnly) { entry.detectOnly = true; detectOnlyCount++; }
+        if (info.imageOnly) { entry.imageOnly = true; entry.unreadReason = info.unreadReason; }
         if (cleanErr) entry.cleanError = cleanErr;
-        console.log('[命中 ' + info.hits + '][' + posLabel(!!info.firstHit, !!info.lastHit) + '] ' + full + '\n       词: ' + info.matched.join('、') + (info.totalChars ? '\n       命中占比: ' + (info.ratio * 100).toFixed(1) + '%（' + info.hitChars + ' / ' + info.totalChars + ' 字）' : ''));
-        if (o.moveTo) {
+        const where = partsText(info.parts, 4);
+        console.log('[命中 ' + info.hits + '][' + (info.detectOnly ? '仅检测' : posLabel(!!info.firstHit, !!info.lastHit)) + '] ' + full + '\n       词: ' + info.matched.join('、') + (info.totalChars ? '\n       命中占比: ' + (info.ratio * 100).toFixed(1) + '%（' + info.hitChars + ' / ' + info.totalChars + ' 字）' : '') + (where ? '\n       位置: ' + where : ''));
+        if (info.detectOnly) {
+          // 只读检测：绝不自动剪切 / 删除——本工具无法清除其内容，删掉等于销毁唯一原件
+          if (o.moveTo || o.delete) console.log('       ↳ 只读格式仅检测，未执行剪切 / 删除（请先转存为 docx）');
+          if (info.imageOnly) console.log('       ↳ 扫描件 PDF：无可读文本层，需人工复核或另存为文本格式');
+        } else if (o.moveTo) {
           const rel = path.relative(fileRoot, full);
           const destPlan = path.join(o.moveTo, rel);
           if (o.moveDryRun) {
@@ -1216,7 +1341,7 @@ async function main() {
             }
           }
         }
-        if (o.delete) {
+        if (!info.detectOnly && o.delete) {
           if (o.deleteDryRun) {
             entry.delete = full;
             console.log('       ↳ 将删除 ' + full);
@@ -1275,16 +1400,20 @@ async function main() {
           // v4.4：逐文件分片。目录一律全跟，否则看不到片内的文件
           if (!inShard(full)) continue;
           scanned++;
-          // v4.67 格式跳过要计数：图片 / .doc / .pdf 被静默略过时，用户会误以为扫过但没命中。
-          if (!(o.docsOnly ? isDocFile(e.name) : D.DWRDoc.isSupported(e.name))) { extSkipped++; continue; }
+          // v4.67 格式跳过要计数：图片 / .pdf 被静默略过时，用户会误以为扫过但没命中。
+          // v4.79 旧版 .doc/.xls/.ppt 进入只读检测（能查不能改），不再算作跳过。
+          if (!(o.docsOnly ? isDocFile(e.name)
+            : (D.DWRDoc.isSupported(e.name) || D.DWRDoc.isDetectableOnly(e.name)))) {
+            extSkipped++; nameOnlyHit(full, '格式不支持'); continue;
+          }
           // Office 所有者锁文件：~$ 开头，Word/Excel 打开文档时生成，非有效 ZIP
           if (e.name.charAt(0) === '~' && e.name.charAt(1) === '$') continue;
           // v4.2.1 超大文件预筛：整盘扫描常遇到几百 MB 的压缩包 / 安装包，
           // processOne 会 readFile 整个文件，CONC 路并发直接把 V8 堆撑爆（Z 盘实测 OOM）。
           // 这里按目录项大小先挡掉，统计为「已跳过」，不静默丢弃。
           let sz = 0;
-          try { sz = fs.statSync(full).size; } catch (e2) { statFailCount++; continue; }
-          if (sz > MAX_FILE_BYTES) { skippedBig++; continue; }
+          try { sz = fs.statSync(full).size; } catch (e2) { statFailCount++; nameOnlyHit(full, '无法读取文件'); continue; }
+          if (sz > MAX_FILE_BYTES) { skippedBig++; nameOnlyHit(full, '超过大小上限'); continue; }
           // v4.7 文件名关键字前置过滤：不读文件就能判掉，省掉整块 IO
           if (!nameHit(full, o.nameWords, o.nameMode)) { nameSkipped++; continue; }
           matched++;
@@ -1307,12 +1436,19 @@ async function main() {
   const sec = ((Date.now() - t0) / 1000).toFixed(1);
 
   if (o.nameWords) console.log('文件名未匹配: ' + nameSkipped + ' 个（未读取，直接跳过）');
-  if (extSkipped) console.log('格式未匹配  : ' + extSkipped + ' 个（图片/.doc/.pdf 等不支持格式，未读取；图片内文字需人工复核或另存为文本格式）');
+  if (extSkipped) console.log('格式未匹配  : ' + extSkipped + ' 个（图片/.rar/.7z 等不支持格式，未读取；图片内文字需人工复核或另存为文本格式）');
   console.log('\n==== 扫描完成 ====');
   if (shardN > 1) console.log('分片结果    : 第 ' + shardK + ' / ' + shardN + ' 片扫到 ' + scanned + ' 个文件' + (scanned < shardN * 50 ? '（本片偏少，可减小 n）' : ''));
   console.log('扫描文件数 : ' + scanned);
   console.log('命中文档数 : ' + hitFiles);
   console.log('命中词次数 : ' + totalHits);
+  if (detectOnlyCount) console.log('仅检测文件 : ' + detectOnlyCount + ' 个（.doc/.xls/.ppt/.rtf/.pdf/.zip 只读检测，不能清除；需转存为 docx / xlsx / pptx 后处理）');
+  if (nameOnlyCount) console.log('仅文件名命中: ' + nameOnlyCount + ' 个（正文未读取，但文件名含敏感词，检查软件照样会报出；需重命名或人工复核）');
+  if (imageOnlyCount) console.log('扫描件 PDF  : ' + imageOnlyCount + ' 个（无可读文本层，无法按文本检索，需人工复核或另存为文本格式）');
+  if (imageOnlyFiles.length) {
+    imageOnlyFiles.slice(0, 10).forEach((p) => console.log('    ' + p));
+    if (imageOnlyCount > 10) console.log('    ……其余 ' + (imageOnlyCount - 10) + ' 个' + (o.html ? '见 HTML 清单' : '（可加 --html 生成可点击清单）'));
+  }
   console.log('耗时       : ' + sec + ' 秒');
   // 跳过计数必须放在所有模式都能走到的地方：此前只在 --clean / --from-report 分支里输出，
   // 纯报告扫描（--dir 不带 --clean）下超大文件被静默跳过，用户看不到跳过了多少。
@@ -1356,7 +1492,7 @@ async function main() {
       results: results, targets: targets, scope: o.scope,
       words: rules.map((r) => r.text),
       groups: groupSummary(rules),
-      scanned: scanned, sec: sec, timeStr: fmtTime(new Date())
+      scanned: scanned, scannedPdfs: imageOnlyFiles, sec: sec, timeStr: fmtTime(new Date())
     }), 'utf8');
     console.log('HTML 索引已写入 ' + htmlPath);
   }
