@@ -340,6 +340,8 @@
           <label class="switch inline" id="scanHideFpWrap" style="display:none;" data-tip="导入检查报告后复检 0 命中的「误报」行默认隐藏，取消勾选可查看全部条目">
             <input type="checkbox" id="scanHideFp" checked> <span id="scanHideFpLabel">隐藏误报</span>
           </label>
+          <button type="button" class="primary" id="scanStartBtn" disabled data-tip="按当前词库重新甄别已导入的报告文件，把检查软件的误报甄别出来（99% 以上通常是误报）">开始复检</button>
+          <button type="button" class="primary" id="scanExportResultBtn" disabled data-tip="把本次扫描/导入报告的结果导出为清单，Excel 可直接打开">导出结果</button>
           <button type="button" class="primary" id="scanCleanBtn" disabled data-tip="把选中的命中文档清理后写回原位置（默认先备份 .bak，可在「输出方式」中关闭）">一键处理选中</button>
           <button type="button" class="primary" id="addScanToFiles" disabled data-tip="加入后会从结果中移出；导出报告仍保留全部命中">加入处理列表（0）</button>
           <span class="spacer"></span>

@@ -2067,6 +2067,11 @@ async function scanFolder() {
       (stats.truncated ? ' · 已达文件数上限，结果可能不完整' : '') +
       (skipN ? ' · <b>' + skipN + '</b> 个未检查（' + skipBreakdown(stats) + '）' : '') +
       (stats.errors ? ' · ' + stats.errors + ' 个文件读取失败' : '');
+
+    // 扫描件 PDF 兜底提示：纯图片无文本层，本工具不做 OCR，必须转人工复核或另存为文本格式
+    if (stats.imageOnly) {
+      log('<span class="t-image">扫描件 PDF：<b>' + stats.imageOnly + '</b> 个文件无可读文本层，本工具不做 OCR，按文本检索不到任何内容，请人工复核或另存为文本格式后重新扫描。</span>', 'warn');
+    }
     log('文件夹扫描完成：命中 ' + stats.hitFiles + ' 个文档 / ' + stats.totalHits + ' 处敏感词'
       + (stats.detectOnly ? '，另有 ' + stats.detectOnly + ' 个只读格式仅检测' : '')
       + (stats.nameOnly ? '，其中 ' + stats.nameOnly + ' 个仅靠文件名中招（正文未读取，需重命名或人工复核）' : '')
@@ -2603,6 +2608,8 @@ async function scanFolder() {
 
   /** 是否为「检查软件误报」行：导入报告后按本工具词库复检 0 命中 */
   function isFalsePositiveRow(r) {
+    // 扫描件 PDF（无文本层）零命中不是误报，是「未读取」，不应被「隐藏误报」一并藏起来。
+    if (r && r.imageOnly) return false;
     return !!(r && r.fromReport && r.checked && r.checkerHits > 0 && !(r.hits > 0));
   }
 
@@ -2929,6 +2936,13 @@ async function scanFolder() {
         return r.fromReport && r.handle && (Doc.isSupported(r.path) || Doc.isDetectableOnly(r.path));
       });
     }
+
+    var startBtn = $('scanStartBtn');
+    if (startBtn) startBtn.disabled = state.importing || !state.scanResults.some(function (r) {
+      return r.fromReport && r.handle && (Doc.isSupported(r.path) || Doc.isDetectableOnly(r.path));
+    });
+    var exportResultBtn = $('scanExportResultBtn');
+    if (exportResultBtn) exportResultBtn.disabled = !(!!state.lastScan && state.scanArchive.length > 0);
 
     syncScanSelAll();
   }
@@ -4950,6 +4964,14 @@ async function scanFolder() {
     var rescreenBtn = $('scanRescreenBtn');
     if (rescreenBtn) rescreenBtn.addEventListener('click', function () {
       rescreenSelected().catch(function (e) { log('重新甄别失败：' + (e.message || e), 'err'); });
+    });
+    var scanStartBtn = $('scanStartBtn');
+    if (scanStartBtn) scanStartBtn.addEventListener('click', function () {
+      rescreenSelected().catch(function (e) { log('开始复检失败：' + (e.message || e), 'err'); });
+    });
+    var scanExportResultBtn = $('scanExportResultBtn');
+    if (scanExportResultBtn) scanExportResultBtn.addEventListener('click', function () {
+      exportScanReport();
     });
     // 扫描结果表过滤 / 排序：结果上千行时按路径、命中词、状态快速定位
     var scanFilterQ = $('scanFilterQ');

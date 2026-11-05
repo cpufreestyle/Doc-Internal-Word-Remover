@@ -473,8 +473,8 @@ const D = ctx.window;
     const README2 = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
     const htmlTips = (HTML2.match(/data-tip=/g) || []).length;
     const appTips = (APP2.match(/data-tip=/g) || []).length;
-  check('v477-index.html 悬停说明数锁死为 147（README 同数）',
-      htmlTips === 147, 'htmlTips=' + htmlTips + ' README 写 147');
+    check('v477-index.html 悬停说明数锁死为 149（README 同数）',
+      htmlTips === 149, 'htmlTips=' + htmlTips + ' README 写 149');
   const htmlIds = Array.from(HTML2.matchAll(/\sid="([^"]+)"/g), (m) => m[1]);
   const duplicateIds = htmlIds.filter((id, i) => htmlIds.indexOf(id) !== i);
   check('v477-index.html 的 id 全局唯一',
@@ -483,7 +483,7 @@ const D = ctx.window;
       appTips === 15, 'appTips=' + appTips + ' README 写 15');
     // README 里的数字必须与代码一致：改一边不改另一边就会误导用户
     check('v459-README 的说明数与代码一致',
-      README2.indexOf('index.html` 的 147 处解释') >= 0
+      README2.indexOf('index.html` 的 149 处解释') >= 0
         && README2.indexOf('动态生成的 15 处') >= 0,
       'README 与代码不同步');
     check('v476-单栏窄屏优先显示文件区',
