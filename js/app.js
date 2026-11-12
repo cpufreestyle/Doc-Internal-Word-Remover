@@ -1249,7 +1249,16 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       var parts = [];
       var imageOnly = false, unreadReason = '';
       if (detectOnly) {
-        var sb = await Doc.scanBytes(path, new Uint8Array(buf), opts.engine);
+        var sb = await Doc.scanBytes(path, new Uint8Array(buf), opts.engine, {
+          shouldCancel: function () { return state.scanCancel; },
+          onProgress: function (p) {
+            if (p && p.pagesTotal) {
+              var showName = String(path || '').replace(/^.*[\\/]/, '');
+              log('正在解析 ' + showName + '：第 ' + p.page + '/' + p.pagesTotal + ' 页');
+            }
+          }
+        });
+        if (sb && sb.cancelled) return;
         hits = sb.hits; matched = sb.matched;
         parts = sb.parts || [];
         imageOnly = !!sb.imageOnly;
@@ -2181,7 +2190,10 @@ async function scanFolder() {
             r.hits = res.hits;
             r.matched = res.matched || [];
           } else if (Doc.isDetectableOnly(r.path)) {
-            p = Doc.scanBytes(r.path, new Uint8Array(buf), engine).then(function (res) {
+            p = Doc.scanBytes(r.path, new Uint8Array(buf), engine, {
+              shouldCancel: function () { return state.importCancel; }
+            }).then(function (res) {
+              if (res && res.cancelled) { r.cancelled = true; return; }
               r.hits = res.hits;
               r.matched = res.matched || [];
               if (res.imageOnly) { r.imageOnly = true; r.unreadReason = res.unreadReason; }

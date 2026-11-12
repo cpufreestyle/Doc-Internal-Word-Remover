@@ -1654,11 +1654,11 @@
   var VIEW_KIND_LABEL = { text: '', attr: '·属性', hide: '·注释', utf16: '·OLE', utf16alt: '·OLE错位', rtf: '·RTF', pdf: '·PDF正文', bin: '·二进制', name: '·条目名' };
 
   /** PDF 正文视图；读不出（加密 / 扫描件 / 损坏）返回 null，由调用方降级 */
-  function pdfViews(bytes) {
+  function pdfViews(bytes, scanOptions) {
     var P = global.DWRPdf;
     if (!P || typeof P.extract !== 'function') return null;
     try {
-      var r = P.extract(bytes);
+      var r = P.extract(bytes, scanOptions);
       if (!r) return null;
       if (!r.text) return null;
       return [{ kind: 'pdf', text: r.text }];
@@ -1667,7 +1667,7 @@
     }
   }
 
-  function viewsFor(name, bytes) {
+  function viewsFor(name, bytes, scanOptions) {
     var n = String(name).toLowerCase();
     if (/\.(?:xml|rels)$/.test(n)) return xmlViews(new TextDecoder('utf-8').decode(bytes));
     if (isTextFile(n)) return [{ kind: 'text', text: decodeText(bytes).text }];
@@ -1680,7 +1680,7 @@
     }
     // PDF：正文压在里面，要解压 + 按 CMap 还原。签名优先，改名成 .doc 的也能读。
     if (isPdfBytes(bytes) || isPdfFile(n)) {
-      var pv = pdfViews(bytes);
+      var pv = pdfViews(bytes, scanOptions);
       if (pv) return pv;
     }
     // RTF 的中文是 \'hh / \uN 转义，按普通文本解码读不到词
@@ -1797,7 +1797,7 @@
    * 清除后自检（纯文本 / 二进制文件）：直接对解码后的全文检索
    * @returns {Promise<{hits:number, matched:string[], parts:Array}>}
    */
-  function verifyBytes(bytes, engine) {
+  function verifyBytes(bytes, engine, scanOptions) {
     if (!bytes || !bytes.length) return Promise.resolve({ hits: 0, matched: [], parts: [] });
     if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
       var ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
@@ -1806,6 +1806,9 @@
       });
     }
     return Promise.resolve().then(function () {
+      if (scanOptions && typeof scanOptions.shouldCancel === 'function' && scanOptions.shouldCancel()) {
+        return { cancelled: true, hits: 0, matched: [], parts: [] };
+      }
       var res = { hits: 0, matched: [], parts: [] };
       scanViews(viewsFor('x.txt', bytes), engine, '', res);
       return res;
@@ -1819,19 +1822,19 @@
    * @param {Uint8Array} bytes
    * @returns {Promise<{hits:number, matched:string[], parts:Array}>}
    */
-  function scanBytes(name, bytes, engine) {
+  function scanBytes(name, bytes, engine, scanOptions) {
     if (!bytes || !bytes.length) return Promise.resolve({ hits: 0, matched: [], parts: [] });
-    if (bytes[0] === 0x50 && bytes[1] === 0x4b) return verifyBytes(bytes, engine);
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b) return verifyBytes(bytes, engine, scanOptions);
     return Promise.resolve().then(function () {
       var res = { hits: 0, matched: [], parts: [] };
       // 旧版二进制没有「部件」概念，部位名带上文件名，至少告诉用户词就在这个文件里
       var base = String(name || '').replace(/^.*[\\/]/, '');
-      scanViews(viewsFor(name, bytes), engine, base, res);
+      scanViews(viewsFor(name, bytes, scanOptions), engine, base, res);
       // 扫描件 PDF：解不出文本层，不计入正文命中，由调用方按「仅文件名 + 需人工复核」处理
       if (isPdfFile(name) || isPdfBytes(bytes)) {
         var P = global.DWRPdf;
         if (P && typeof P.extract === 'function') {
-          var er = P.extract(bytes);
+          var er = P.extract(bytes, scanOptions);
           if (er && er.imageOnly) {
             res.imageOnly = true;
             res.unreadReason = '扫描件 PDF，无可读文本层，需人工复核或另存为文本格式';

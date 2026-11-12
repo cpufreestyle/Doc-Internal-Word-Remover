@@ -2499,6 +2499,185 @@ const presetsEngine = D.DWRRules.createEngine({
       mr && mr.imageOnly === false && mr.chars > 0,
       JSON.stringify(mr));
   }
+
+  // v482-P1：多页 PDF 的页级进度 / 取消，以及跨页阅读顺序归一化。
+  // 大 PDF 逐页解密解压耗时可观，没有进度和取消用户只能干等；
+  // 阅读顺序错乱则会把分页文档的句子拆散，造成误判。
+  {
+    /**
+     * 拼一份 n 页 PDF，每页一段文字（第 1 页 100pt，第 2 页 50pt …）。
+     * 对象号必须各占各的：1 catalog / 2 pages / 3 font / 4 ToUnicode，
+     * 页与内容流从 5 号往后排。早先的版本让页对象和 ToUnicode 撞了号——
+     * PDF 里同名对象后者覆盖前者，页面凭空少掉，看着像解析器漏页，
+     * 其实是夹具本身不合法。
+     */
+    function makeMultiPagePdf(pageCount) {
+      const enc = (s) => Buffer.from(s, 'latin1');
+      const objs = [];
+      const kids = [];
+      let objNo = 5;
+      for (let i = 0; i < pageCount; i++) {
+        const pageObj = objNo++;
+        const contentObj = objNo++;
+        kids.push(pageObj + ' 0 R');
+        objs.push(enc(pageObj + ' 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> /Contents ' + contentObj + ' 0 R >> endobj\n'));
+        const y = 800 - i * 50;
+        const body = 'BT /F1 12 Tf 1 0 0 1 40 ' + y + ' Tm <00010002> Tj ET';
+        objs.push(enc(contentObj + ' 0 obj << /Length ' + body.length + ' >>\nstream\n' + body + '\nendstream endobj\n'));
+      }
+      return Buffer.concat([
+        enc('%PDF-1.4\n'),
+        enc('1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n'),
+        enc('2 0 obj << /Type /Pages /Kids [' + kids.join(' ') + '] /Count ' + pageCount + ' >> endobj\n'),
+        enc('3 0 obj << /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /ToUnicode 4 0 R >> endobj\n'),
+        enc('4 0 obj << /Length ' + CMAP.length + ' >>\nstream\n' + CMAP + '\nendstream endobj\n'),
+        enc('trailer << /Root 1 0 R >>\n%%EOF\n'),
+      ].concat(objs));
+    }
+
+    const multi = makeMultiPagePdf(5);
+    const prog = [];
+    const mr5 = D.DWRPdf.extract(new Uint8Array(multi), {
+      onProgress: function (p) { prog.push(p.page + '/' + p.pagesTotal); }
+    });
+    check('v482-多页 PDF 逐页回报进度',
+      prog.length === 5 && prog[0] === '1/5' && prog[4] === '5/5',
+      JSON.stringify(prog));
+    check('v482-多页 PDF 提取结果包含全部页',
+      mr5 && mr5.pages === 5 && mr5.chars > 0,
+      JSON.stringify(mr5 && { pages: mr5.pages, chars: mr5.chars }));
+
+    const cancelSeen = [];
+    const cancelled = D.DWRPdf.extract(new Uint8Array(multi), {
+      shouldCancel: function () {
+        cancelSeen.push(1);
+        return cancelSeen.length > 2;
+      }
+    });
+    check('v482-多页 PDF 可在页级取消',
+      cancelled && cancelled.cancelled === true && cancelled.pagesDone === 2,
+      JSON.stringify(cancelled));
+
+    // 页序归一化：多页正文按页序接起来，每页一段都在。
+    check('v482-多页 PDF 正文按页序拼接',
+      mr5 && (mr5.text.match(/内部/g) || []).length === 5,
+      JSON.stringify(mr5 && mr5.text));
+
+    /**
+     * 单页多块：内容流故意从下往上写，视觉顺序是从上往下。
+     * 解析器要按坐标把块排回视觉顺序，否则同一段话会被拆散，
+     * 「紧邻才成立」这类规则也就跟着判错。
+     */
+    function makeUnorderedPagePdf() {
+      const enc = (s) => Buffer.from(s, 'latin1');
+      const rows = [{ y: 700, t: 'AAA' }, { y: 650, t: 'BBB' }, { y: 600, t: 'CCC' }];
+      const body = rows.slice().reverse().map(function (r) {
+        return 'BT /F1 12 Tf 1 0 0 1 40 ' + r.y + ' Tm (' + r.t + ') Tj ET';
+      }).join('\n');
+      return Buffer.concat([
+        enc('%PDF-1.4\n'),
+        enc('1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n'),
+        enc('2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n'),
+        enc('3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n'),
+        enc('4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n'),
+        enc('5 0 obj << /Length ' + body.length + ' >>\nstream\n' + body + '\nendstream endobj\n'),
+        enc('trailer << /Root 1 0 R >>\n%%EOF\n'),
+      ]);
+    }
+    const ext = D.DWRPdf.extract(new Uint8Array(makeUnorderedPagePdf()));
+    check('v482-单页多块按视觉顺序拼接',
+      ext && ext.text.indexOf('AAA') >= 0 &&
+      ext.text.indexOf('AAA') < ext.text.indexOf('BBB') &&
+      ext.text.indexOf('BBB') < ext.text.indexOf('CCC'),
+      JSON.stringify(ext && ext.text));
+  }
+}
+
+/* v482 分栏排版：双栏 PDF 必须按「左栏读完再右栏」的视觉顺序提取。
+   内容流是按栏写的（Word / WPS 的真实写法），只按 Y 排序会左右交叉，
+   读成「A1 B1 A2 B2」——密级词落在哪一栏的上下文就错了。 */
+{
+  /* 中文要走 Identity-H + ToUnicode：给每个字分配两字节码位，再写一份 CMap。 */
+  const codeMap = new Map();
+  let nextCode = 1;
+  const codeOf = (ch) => {
+    if (!codeMap.has(ch)) codeMap.set(ch, nextCode++);
+    return codeMap.get(ch);
+  };
+  const hexOf = (text) => {
+    let out = '';
+    for (const ch of text) out += codeOf(ch).toString(16).padStart(4, '0');
+    return out.toUpperCase();
+  };
+  const buildCMap = () => {
+    const rows = [];
+    for (const [ch, code] of codeMap) {
+      rows.push('<' + code.toString(16).padStart(4, '0') + '> <' +
+        ch.charCodeAt(0).toString(16).padStart(4, '0') + '>');
+    }
+    return [
+      '/CIDInit /ProcSet findresource begin',
+      '12 dict begin',
+      'begincmap',
+      '/CMapName /Adobe-Identity-UCS def',
+      '/CMapType 2 def',
+      '1 begincodespacerange',
+      '<0000> <FFFF>',
+      'endcodespacerange',
+      rows.length + ' beginbfchar',
+      ...rows,
+      'endbfchar',
+      'endcmap',
+      'CMapName currentdict /CMap defineresource pop',
+      'end',
+      'end',
+    ].join('\n');
+  };
+  const buildPdf = (body) => {
+    const enc = (s) => Buffer.from(s, 'latin1');
+    const cmap = buildCMap();
+    return Buffer.concat([
+      enc('%PDF-1.4\n'),
+      enc('1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n'),
+      enc('2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n'),
+      enc('3 0 obj << /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n'),
+      enc('4 0 obj << /Type /Font /Subtype /Type0 /BaseFont /SimSun /Encoding /Identity-H /ToUnicode 6 0 R >> endobj\n'),
+      enc('5 0 obj << /Length ' + body.length + ' >>\nstream\n' + body + '\nendstream endobj\n'),
+      enc('6 0 obj << /Length ' + cmap.length + ' >>\nstream\n' + cmap + '\nendstream endobj\n'),
+      enc('trailer << /Root 1 0 R >>\n%%EOF\n'),
+    ]);
+  };
+
+  /* 双栏：左栏 3 行、右栏 3 行，栏间距 70pt；内容流按「左栏整列 → 右栏整列」写。 */
+  const colLines = [];
+  for (let i = 0; i < 3; i++) {
+    colLines.push({ x: 50, y: 700 - i * 18, t: '左栏第' + (i + 1) + '行内部资料请按规定处理不得外传' });
+    colLines.push({ x: 320, y: 700 - i * 18, t: '右栏第' + (i + 1) + '行绝密内容仅限本人查阅' });
+  }
+  const colBody = colLines.filter((l) => l.x === 50).concat(colLines.filter((l) => l.x === 320))
+    .map((l) => 'BT /F1 10 Tf 1 0 0 1 ' + l.x + ' ' + l.y + ' Tm <' + hexOf(l.t) + '> Tj ET')
+    .join('\n');
+  const colExt = D.DWRPdf.extract(new Uint8Array(buildPdf(colBody)));
+  const colText = (colExt && colExt.text) || '';
+  check('v482-双栏 PDF 按栏阅读（左栏读完再右栏，不左右交叉）',
+    colText.indexOf('左栏第1行') >= 0 &&
+    colText.indexOf('左栏第1行') < colText.indexOf('左栏第3行') &&
+    colText.indexOf('左栏第3行') < colText.indexOf('右栏第1行') &&
+    colText.indexOf('右栏第1行') < colText.indexOf('右栏第3行'),
+    JSON.stringify(colText));
+
+  /* 反例：单栏但字距被拉宽（每个字一个 BT、两行）——不能被误判成两栏拆开。
+     竖沟宽度（18pt）已经超过门槛，靠「块宽不小于竖沟宽」这条才拦得住。 */
+  const wideChars = '内部文件仅限'.split('').concat('本人查阅'.split(''));
+  const wideBody = [0, 1].map((row) => wideChars.slice(row * 5, row * 5 + 5)
+    .map((c, i) => 'BT /F1 12 Tf 1 0 0 1 ' + (50 + i * 30) + ' ' + (700 - row * 20) +
+      ' Tm <' + hexOf(c) + '> Tj ET')
+    .join('\n')).join('\n');
+  const wideExt = D.DWRPdf.extract(new Uint8Array(buildPdf(wideBody)));
+  const wideText = (wideExt && wideExt.text) || '';
+  check('v482-加宽字距的单栏不被误判成分栏',
+    wideText.replace(/\s+/g, '') === '内部文件仅限本人查阅',
+    JSON.stringify(wideText));
 }
 
 console.log('\n==== ' + (fail === 0 ? '全部通过' : '存在失败') + ' ====');

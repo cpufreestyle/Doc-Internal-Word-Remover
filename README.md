@@ -135,7 +135,7 @@ node test-e2e.mjs
 
 `npm test` 覆盖格式处理、规则匹配、报告解析、并发、界面逻辑和安全边界。Playwright 冒烟测试需要 Chromium。
 
-版本变更见 `CHANGELOG.md（5 条版本记录）`。
+版本变更见 `CHANGELOG.md（6 条版本记录）`。
 
 ## 许可
 

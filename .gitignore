@@ -38,6 +38,18 @@ _rea/
 _v38report.png
 _v39report.png
 
+# 本地探针与一次性工作区（调试用，不入库）
+_scratch/
+_craft-anything/
+.tmp_*.txt
+_tmp_*.txt
+_scratch*.txt
+_*.ps1
+_*.mjs
+!_e2e_*.mjs
+_*.txt
+_finding*.json
+
 # 临时说明文件与本地测试日志（不应入库）
 diag-out.txt
 *.mp4

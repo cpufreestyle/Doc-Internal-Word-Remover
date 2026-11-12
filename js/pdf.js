@@ -592,6 +592,102 @@
   }
 
   /**
+   * 估一段文本在页面上的宽度（pt）。只用于判断页面是不是分栏排版，
+   * 不参与关键字匹配，所以粗估即可：汉字按全角 1em，西文按 0.52em。
+   * 块内多行时取最宽的一行。
+   */
+  function estTextWidth(text, size) {
+    var s = size > 0 ? size : 10;
+    var best = 0, w = 0;
+    for (var i = 0; i < text.length; i++) {
+      if (text.charAt(i) === '\n') { if (w > best) best = w; w = 0; continue; }
+      var code = text.charCodeAt(i);
+      w += (code >= 0x2e80) ? 1.0 : ((code >= 0x20 && code <= 0x7e) ? 0.52 : 0.5);
+    }
+    return (w > best ? w : best) * s;
+  }
+
+  /**
+   * 把块按 Y 分行（容差 3pt）。分行是判断分栏的关键：
+   * 真分栏时，同一行里左侧栏和右侧栏的块都在。
+   */
+  function groupRows(items) {
+    var rows = [];
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i], placed = false;
+      for (var r = 0; r < rows.length; r++) {
+        if (Math.abs(it.y - rows[r].y) <= 3) { rows[r].items.push(it); placed = true; break; }
+      }
+      if (!placed) rows.push({ y: it.y, items: [it] });
+    }
+    rows.sort(function (a, b) { return b.y - a.y; });
+    return rows;
+  }
+
+  function medianOf(nums) {
+    if (!nums.length) return 0;
+    var a = nums.slice().sort(function (x, y) { return x - y; });
+    var m = a.length >> 1;
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+  }
+
+  /**
+   * 找分栏的竖沟（栏与栏之间的空白带）。返回升序的边界数组，
+   * 空数组表示整页单栏。
+   *
+   * 判据要同时满足，否则会误伤：
+   *  - 竖沟够宽（≥12pt）；
+   *  - 竖沟两侧都有块，且各自跨 ≥2 行（真栏目，不是同一行里两个图标）；
+   *  - ≥2 行同时出现左右两侧的块（两栏在同一基线上对齐）；
+   *  - 两侧块的典型宽度不小于竖沟宽度——否则「字距很宽的一行字」
+   *    会被误判成两栏。
+   */
+  function detectColumnGaps(items) {
+    if (items.length < 4) return [];
+    var sorted = items.slice().sort(function (a, b) { return a.x - b.x; });
+    var ranges = [];
+    for (var i = 0; i < sorted.length; i++) {
+      var s0 = sorted[i].x, e0 = sorted[i].x + sorted[i].w;
+      var last = ranges[ranges.length - 1];
+      if (!last || s0 > last[1]) ranges.push([s0, e0]);
+      else if (e0 > last[1]) last[1] = e0;
+    }
+    var rows = groupRows(items);
+    var gaps = [];
+    for (var g = 1; g < ranges.length; g++) {
+      var gStart = ranges[g - 1][1], gEnd = ranges[g][0];
+      var gw = gEnd - gStart;
+      if (gw < 12) continue;
+      var left = [], right = [];
+      for (var k = 0; k < items.length; k++) {
+        var it = items[k];
+        if (it.x + it.w <= gStart + 1) left.push(it);
+        else if (it.x >= gEnd - 1) right.push(it);
+      }
+      if (left.length < 2 || right.length < 2) continue;
+      var bothRows = 0, leftRows = 0, rightRows = 0;
+      for (var r = 0; r < rows.length; r++) {
+        var hasL = false, hasR = false;
+        for (var q = 0; q < rows[r].items.length; q++) {
+          var ri = rows[r].items[q];
+          if (left.indexOf(ri) >= 0) hasL = true;
+          if (right.indexOf(ri) >= 0) hasR = true;
+        }
+        if (hasL) leftRows++;
+        if (hasR) rightRows++;
+        if (hasL && hasR) bothRows++;
+      }
+      if (bothRows < 2) continue;
+      if (leftRows < 2 || rightRows < 2) continue;
+      var lw = medianOf(left.map(function (it) { return it.w; }));
+      var rw = medianOf(right.map(function (it) { return it.w; }));
+      if (lw < gw || rw < gw) continue;
+      gaps.push({ start: gStart, end: gEnd });
+    }
+    return gaps;
+  }
+
+  /**
    * 解一条内容流。`owner` 是提供 /Resources 的对象（页面或表单），
    * 这样 `Do` 调用的 Form XObject 才能继续往里读——页眉页脚、水印、
    * 图表标注里的「内部」常整块放在表单对象里，只看页面内容流会漏。
@@ -600,6 +696,12 @@
     var toks = tokenize(src);
     if (!toks) return '';
     var s = '', ops = [], arr = null, dictDepth = 0, cur = null, i, k, j;
+    // P1 阅读顺序归一化：BT 块级收集，块间按坐标排序，块内保持流内顺序。
+    // 逐字定位的 PDF（思维导图、图表标注、整块水印）一个字一个 BT，
+    // 块内绝不能拆词；块间按 Y 从上到下、同 Y 从左到右排，才是视觉阅读顺序。
+    var blocks = [], curBlock = null;
+    var lx = 0, ly = 0, leading = 0;   // 文本行矩阵原点与行距
+    var curSize = 10;                  // 当前字号，用来估算块宽（判断分栏）
     for (i = 0; i < toks.length; i++) {
       var t = toks[i];
       if (t.t === 'op' && t.v === '<<') { dictDepth++; continue; }
@@ -616,12 +718,43 @@
         var nm = null;
         for (k = 0; k < ops.length; k++) if (ops[k].t === 'name') nm = ops[k].v;
         cur = nm && fonts ? (fonts.get(nm) || null) : null;
+        var fsz = 0;
+        for (k = 0; k < ops.length; k++) if (ops[k].t === 'num') fsz = +ops[k].v;
+        if (fsz > 0) curSize = fsz;
+      } else if (v === 'Tm') {
+        // Tm 是绝对定位：后两个数就是行矩阵原点 (e, f)
+        if (ops.length >= 2) {
+          lx = +ops[ops.length - 2].v;
+          ly = +ops[ops.length - 1].v;
+          if (curBlock && curBlock.y === null) { curBlock.y = ly; curBlock.x = lx; }
+        }
+      } else if (v === 'Td' || v === 'TD') {
+        // Td / TD 是相对上一行矩阵的平移，必须累加：
+        // 当成绝对坐标用，所有行都会落到原点附近，排序等于没排。
+        if (ops.length >= 2) {
+          var tdx = +ops[ops.length - 2].v, tdy = +ops[ops.length - 1].v;
+          if (v === 'TD') leading = -tdy;
+          lx += tdx; ly += tdy;
+          // 排序键只取块内第一次定位：Td 在段落内是逐行下移，取最后一次会让
+          // 长段落落到页面底部，阅读顺序反而乱掉。
+          if (curBlock && curBlock.y === null) { curBlock.y = ly; curBlock.x = lx; }
+        }
+      } else if (v === 'T*') {
+        // T* 换到下一行：行距由 TD 设定，没设就是 0
+        ly -= leading;
+        if (curBlock && curBlock.y === null) { curBlock.y = ly; curBlock.x = lx; }
       } else if (v === 'Tj' || v === "'" || v === '"') {
-        if (v !== 'Tj') s += '\n';
-        s += textOf(ops[ops.length - 1], cur);
+        if (v !== 'Tj') { if (curBlock) curBlock.text += '\n'; else s += '\n'; }
+        var txt = textOf(ops[ops.length - 1], cur);
+        if (curBlock) { curBlock.text += txt; if (!curBlock.size) curBlock.size = curSize; }
+        else s += txt;
       } else if (v === 'TJ') {
         var a = ops[ops.length - 1];
-        if (a && a.t === 'arr') for (j = 0; j < a.v.length; j++) s += textOf(a.v[j], cur);
+        if (a && a.t === 'arr') for (j = 0; j < a.v.length; j++) {
+          var jt = textOf(a.v[j], cur);
+          if (curBlock) { curBlock.text += jt; if (!curBlock.size) curBlock.size = curSize; }
+          else s += jt;
+        }
       } else if (v === 'Do') {
         var xn = null;
         for (k = 0; k < ops.length; k++) if (ops[k].t === 'name') xn = ops[k].v;
@@ -634,25 +767,75 @@
             var sub = streamText(ctx, xo);
             if (sub) {
               var subFonts = resolveFonts(ctx, fontsOf(ctx.objs, xo)) || fonts;
-              s += decodeContent(ctx, sub, xo, subFonts, depth + 1, seen) + '\n';
+              var subTxt = decodeContent(ctx, sub, xo, subFonts, depth + 1, seen) + '\n';
+              if (curBlock) curBlock.text += subTxt; else s += subTxt;
             }
           }
         }
       } else if (v === 'BT' || v === 'ET' || v === 'T*') {
         // 只在这三处断行。Td / Tm 是「每字定位」，按它断行会把「秘密」拆成
         // 两行——这类逐字定位的 PDF 很常见（思维导图、图表标注），一律漏词。
-        s += '\n';
+        if (v === 'BT') {
+          // 规范里 BT 会把文本矩阵与行矩阵复位，所以块起点要等块内第一次 Td/Tm；
+          // 沿用上一块的坐标只会把新段落排到旧位置附近。
+          lx = 0; ly = 0; leading = 0;
+            curBlock = { y: null, x: null, text: '', size: 0 };
+          blocks.push(curBlock);
+        } else if (v === 'ET') {
+          curBlock = null;
+        }
       }
       ops = [];
       arr = null;
     }
-    return s;
+    // P1 阅读顺序归一化：BT 块按视觉顺序排序（Y 从上到下，同 Y 从左到右），
+    // 块内保持原有片段顺序，避免逐字定位的「内 部」被拆散。容差内视为同一行。
+    var ordered = '';
+    if (blocks.length) {
+      // 没定位的块（缺 Tm / Td）继承前后已知坐标：向前继承上一块，
+      // 还不知道就向后借下一块的，两头都没有就只能按流内顺序留在原位。
+      for (var bi = 1; bi < blocks.length; bi++) {
+        if (blocks[bi].y == null) { blocks[bi].y = blocks[bi - 1].y; }
+        if (blocks[bi].x == null) { blocks[bi].x = blocks[bi - 1].x; }
+      }
+      for (var bj = blocks.length - 2; bj >= 0; bj--) {
+        if (blocks[bj].y == null) { blocks[bj].y = blocks[bj + 1].y; }
+        if (blocks[bj].x == null) { blocks[bj].x = blocks[bj + 1].x; }
+      }
+      // 排序键缺失的块（两页都没坐标）不参与排序：留在原位，
+      // 免得被当成 Y=0 拖到页面最底下。
+      var keyed = blocks.filter(function (b) { return b.y != null; });
+      var unkeyed = blocks.filter(function (b) { return b.y == null; });
+
+      // 分栏检测：整页单栏就按 (Y 从上到下, 同 Y 从左到右) 排；
+      // 若是两栏 / 三栏，先按栏从左到右，栏内再从上到下——
+      // 否则左右两栏会按行交叉，读出来变成「A1 B1 A2 B2」。
+      var items = keyed.filter(function (b) { return b.text; }).map(function (b) {
+        b.col = 0;
+        return { x: b.x, y: b.y, w: estTextWidth(b.text, b.size), b: b };
+      });
+      var gaps = detectColumnGaps(items);
+      for (var gi = 0; gi < gaps.length; gi++) {
+        for (var qi = 0; qi < items.length; qi++) {
+          if (items[qi].x >= gaps[gi].start) items[qi].b.col++;
+        }
+      }
+
+      keyed.sort(function (a, b) {
+        if (a.col !== b.col) return a.col - b.col;
+        var dY = b.y - a.y;
+        return Math.abs(dY) < 2 ? (a.x - b.x) : dY;
+      });
+      ordered = keyed.concat(unkeyed).map(function (b) { return b.text; })
+        .filter(function (t) { return t !== ''; }).join('\n');
+    }
+    return s + ordered;
   }
 
   function contentRefs(objs, page) {
     var dict = page.dict || '';
     var refs = [], m;
-    var one = /\/Contents\s+(\d+)\s+(\d+)\s+R/.exec(dict);
+    var one = /\/Contents\s+(\d+)\s+\d+\s+R/.exec(dict);
     if (one) { refs.push(one[1]); return refs; }
     var arr = /\/Contents\s*\[([\s\S]{0,4000}?)\]/.exec(dict);
     if (arr) {
@@ -955,7 +1138,7 @@
    * @param {Uint8Array} bytes
    * @returns {{text:string, pages:number, encrypted:boolean, chars:number}|null}
    */
-  function extract(bytes) {
+  function extract(bytes, options) {
     if (!bytes || bytes.length < 16) return null;
     if (!(bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46)) return null;
     var ctx = {
@@ -991,6 +1174,19 @@
 
     var text = '';
     for (var p = 0; p < pages.length; p++) {
+      if (options && typeof options.shouldCancel === 'function' && options.shouldCancel()) {
+        return {
+          cancelled: true,
+          pagesDone: p,
+          pagesTotal: pages.length
+        };
+      }
+      if (options && typeof options.onProgress === 'function') {
+        options.onProgress({
+          page: p + 1,
+          pagesTotal: pages.length
+        });
+      }
       var fonts = resolveFonts(ctx, pageFonts(ctx, pages[p]) || inherit);
       var refs = contentRefs(ctx.objs, pages[p]);
       for (var r = 0; r < refs.length; r++) {
