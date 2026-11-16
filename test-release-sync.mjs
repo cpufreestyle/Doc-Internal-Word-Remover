@@ -135,8 +135,9 @@ assert.deepEqual(
   const MB = 1024 * 1024;
   assert.ok(uploadTimeoutMs(1 * MB) >= 45000, '小包也应有 45 秒保底');
   assert.ok(uploadTimeoutMs(10 * MB) > uploadTimeoutMs(1 * MB), '大包的超时必须更长');
-  assert.ok(uploadTimeoutMs(10 * MB) >= 200000, '10MB 的包超时至少 200 秒');
-  assert.ok(uploadTimeoutMs(1000 * MB) <= 600000, '超时要有上限，不能无限长');
+  // 跨境实测只有几十 KB/s：10MB 必须给到分钟级，200 秒不够（曾三次各 4 分钟全超时）
+  assert.ok(uploadTimeoutMs(10 * MB) >= 500000, '10MB 的包超时至少 500 秒');
+  assert.ok(uploadTimeoutMs(1000 * MB) <= 1800000, '超时要有上限，不能无限长');
 }
 
 console.log('release sync: 8/8 passed');

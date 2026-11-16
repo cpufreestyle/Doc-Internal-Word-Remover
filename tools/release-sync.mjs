@@ -44,13 +44,14 @@ function authHeaders(token, extra = {}) {
  * 按包体大小给上传类请求留足时间。
  *
  * 发布包从约 1MB 涨到约 10MB（随包分发的 OCR 识别模型），而 GitHub
- * Actions 的 runner 在美西、目标在 Gitee，10MB 走一趟要四十多秒——
- * 固定 45 秒的写死超时刚好卡在边上，表现为「上传 Gitee 附件…超时」。
- * 按字节数给上限：每 MB 额外给 20 秒，最低 45 秒、封顶 10 分钟。
+ * Actions 的 runner 在美西、目标在 Gitee，跨境上传实测只有几十 KB/s：
+ * 10MB 的包按 45 秒写死超时必挂，按「每 MB 20 秒」也刚好卡在边界上
+ * （实测三次重试各 4 分钟全部超时）。这里给到每 MB 60 秒——
+ * 10MB 约 10.6 分钟，按 17KB/s 的保守速度也能传完；封顶 30 分钟。
  */
 function uploadTimeoutMs(byteLength) {
   const mb = (Number(byteLength) || 0) / (1024 * 1024);
-  return Math.min(600000, Math.max(45000, Math.ceil(45000 + mb * 20000)));
+  return Math.min(1800000, Math.max(45000, Math.ceil(45000 + mb * 60000)));
 }
 
 async function request(url, options = {}, label = 'API 请求', timeoutMs = 45000, allowRetry = false) {
@@ -239,7 +240,9 @@ async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log =
       method: 'POST',
       headers: authHeaders(token),
       body: f,
-    }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), true);
+      // 不在这里重试：一次超时已经是十几分钟，重试只会把同样的慢速上传再走一遍。
+      // 定时任务每 30 分钟会重跑一次，天然就是更合适的重试节奏。
+    }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), false);
   };
   try {
     await post();
