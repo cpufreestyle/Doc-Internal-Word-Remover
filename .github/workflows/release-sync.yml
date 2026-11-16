@@ -17,6 +17,11 @@ on:
         required: false
         default: false
         type: boolean
+      replace_asset:
+        description: '两边附件 SHA256 不一致时，以 GitHub 为准替换 Gitee 附件（会删除 Gitee 上的旧附件，慎用）'
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: '17,47 * * * *'
 
@@ -43,6 +48,7 @@ jobs:
           SYNC_TAG: ${{ inputs.tag }}
           SYNC_DRY_RUN: ${{ inputs.dry_run }}
           SYNC_UPDATE_BODY: ${{ inputs.update_body }}
+          SYNC_REPLACE_ASSET: ${{ inputs.replace_asset }}
         run: |
           args=()
           if [ -n "$SYNC_TAG" ]; then
@@ -53,5 +59,8 @@ jobs:
           fi
           if [ "$SYNC_UPDATE_BODY" = "true" ]; then
             args+=(--update-body)
+          fi
+          if [ "$SYNC_REPLACE_ASSET" = "true" ]; then
+            args+=(--replace-asset)
           fi
           node tools/release-sync.mjs "${args[@]}"

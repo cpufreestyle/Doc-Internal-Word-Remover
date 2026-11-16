@@ -12,6 +12,7 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--update-body') options.updateBody = true;
+    else if (arg === '--replace-asset') options.replaceAsset = true;
     else if (arg === '--tag') {
       options.tag = argv[i + 1] || '';
       i += 1;
@@ -281,6 +282,24 @@ async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log =
   }
 }
 
+/**
+ * 删除 Gitee 上的旧附件。
+ *
+ * 用途只有一个：发版重跑时 GitHub 会重新构建 zip（哈希必然变化），
+ * 而 Gitee 上还挂着上一轮的文件。此时「两边都有附件」但内容不一致，
+ * 光校验只能报错，镜像会一直停在旧版本。删掉旧的再传新的，
+ * 需要显式传 --replace-asset —— 默认仍然中止，避免误删人工上传的附件。
+ */
+async function deleteGiteeAsset(owner, repo, token, release, asset) {
+  const assetId = asset && asset.id;
+  if (!assetId) throw new Error(`Gitee 附件 ${asset && asset.name} 缺少 id，无法替换`);
+  const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files/${assetId}`;
+  await request(url, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  }, `删除旧 Gitee 附件 ${asset.name}`);
+}
+
 async function verifyAssetPair(tag, githubAsset, giteeAsset) {
   const giteeBuffer = await download(giteeAsset.browser_download_url, `下载 Gitee 附件 ${tag}`);
   const giteeHash = sha256(giteeBuffer);
@@ -313,6 +332,7 @@ export async function synchronize({
   tag = '',
   dryRun = false,
   updateBody = false,
+  replaceAsset = false,
   log = console.log,
 }) {
   const [githubReleases, giteeReleases] = await Promise.all([
@@ -405,7 +425,23 @@ export async function synchronize({
       changes += 1;
     } else {
       log(`校验：${currentTag} 附件 SHA256`);
-      await verifyAssetPair(currentTag, githubAsset, giteeAsset);
+      try {
+        await verifyAssetPair(currentTag, githubAsset, giteeAsset);
+      } catch (error) {
+        // 发版重跑会重建 zip，哈希必然变；Gitee 上还是上一轮的文件。
+        // 默认把不一致当错误上报（不擅自删除已有附件），
+        // 只有显式 --replace-asset 才以 GitHub 为准替换。
+        if (!replaceAsset) throw error;
+        log(`附件不一致，按 GitHub 为准替换 Gitee 附件：${currentTag}`);
+        if (dryRun) {
+          changes += 1;
+          continue;
+        }
+        const buffer = await download(githubAsset.browser_download_url, `下载 GitHub 附件 ${currentTag}`);
+        await deleteGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, giteeAsset);
+        await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log);
+        changes += 1;
+      }
     }
   }
 
@@ -414,10 +450,12 @@ export async function synchronize({
 
 function usage() {
   return [
-    '用法：node tools/release-sync.mjs [--tag vX.Y.Z] [--dry-run] [--update-body]',
+    '用法：node tools/release-sync.mjs [--tag vX.Y.Z] [--dry-run] [--update-body] [--replace-asset]',
     '',
     '  --update-body  两边正文不一致时，把 Gitee 正文对齐 GitHub。',
     '                 默认不传：发现不一致就中止，避免覆盖人工编辑。',
+    '  --replace-asset 两边附件 SHA256 不一致时，以 GitHub 为准替换 Gitee 附件。',
+    '                 默认不传：发现不一致就报错，不擅自删除已有附件。',
     '环境变量：GITHUB_TOKEN、GITEE_TOKEN',
     '可选变量：GITHUB_OWNER、GITHUB_REPO、GITEE_OWNER、GITEE_REPO',
   ].join('\n');
@@ -438,6 +476,7 @@ async function main() {
     tag: options.tag,
     dryRun: options.dryRun,
     updateBody: Boolean(options.updateBody),
+    replaceAsset: Boolean(options.replaceAsset),
   });
   console.log(`完成：检查 ${result.checked} 个 Release，${result.dryRun ? '预计' : '实际'}变更 ${result.changes} 个。`);
 }

@@ -116,9 +116,11 @@ jobs:
       # 发布标红。release-sync 定时任务每 30 分钟会重跑，天然会补上。
       # --update-body：这里的正文是刚由 CHANGELOG 生成的机器正文，
       # 不存在「人工修改被覆盖」的问题；重跑发版时两边正文一致才不会卡住。
+      # --replace-asset：重跑发版会重建 zip、哈希必然变化；以本次 GitHub 的
+      # 产物为准替换 Gitee 上的旧附件，镜像才不会一直停在旧版本。
       - name: Sync release to Gitee
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-        run: node tools/release-sync.mjs --tag "$GITHUB_REF_NAME" --update-body
+        run: node tools/release-sync.mjs --tag "$GITHUB_REF_NAME" --update-body --replace-asset

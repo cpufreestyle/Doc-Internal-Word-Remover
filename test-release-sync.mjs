@@ -11,6 +11,8 @@ function release(tag, body = 'michaelqiu 出品') {
     target_commitish: 'main',
     prerelease: false,
     assets: [{
+      // Gitee 侧替换附件要靠这个 id（真实 API 会返回）
+      id: 1000 + tag.charCodeAt(1),
       name: assetName,
       browser_download_url: `https://assets.test/${tag}.zip`,
     }],
@@ -34,8 +36,13 @@ function mockFetch({ github, gitee, githubAsset = 'same', giteeAsset = 'same' })
         existing.id = 49;
         return Response.json(existing, { status: 200 });
       }
-      if (value.includes('/releases/99/attach_files') && method === 'POST') {
+      // 任意 release 的附件上传（缺失时创建的是 99，替换已有附件时是 49）
+      if (value.includes('/attach_files') && method === 'POST') {
         return Response.json({ name: 'Doc-Internal-Word-Remover-v1.0.0.zip' }, { status: 201 });
+      }
+      // 删除旧附件（替换附件时才走到）
+      if (value.includes('/attach_files/') && method === 'DELETE') {
+        return new Response(null, { status: 204 });
       }
       if (value.includes('api.github.com/repos/o/r/releases?')) {
         return Response.json(github);
@@ -157,4 +164,42 @@ assert.deepEqual(
   assert.ok(body.includes(payload), '文件字节必须原样嵌入（二进制不能被转码）');
 }
 
-console.log('release sync: 9/9 passed');
+// v4.98：发版重跑会重建 zip，哈希必然变，而 Gitee 上还是上一轮的文件。
+//   默认必须报错（不擅自删除已有附件）；显式 --replace-asset 时，
+//   才以 GitHub 为准删旧传新。
+{
+  const a = release('v1.0.0');
+  a.assets[0].browser_download_url = 'https://assets.test/github-v1.zip';
+  const b = release('v1.0.0');
+  b.assets[0].browser_download_url = 'https://assets.test/gitee-v1.zip';
+  globalThis.fetch = mockFetch({ github: [a], gitee: [b], githubAsset: 'NEW', giteeAsset: 'OLD' }).fetch;
+  await assert.rejects(() => synchronize(common), /附件内容不一致/);
+}
+{
+  const a = release('v1.0.0');
+  a.assets[0].browser_download_url = 'https://assets.test/github-v1.zip';
+  const b = release('v1.0.0');
+  b.assets[0].browser_download_url = 'https://assets.test/gitee-v1.zip';
+  const fake = mockFetch({ github: [a], gitee: [b], githubAsset: 'NEW', giteeAsset: 'OLD' });
+  globalThis.fetch = fake.fetch;
+  const result = await synchronize({ ...common, replaceAsset: true });
+  assert.equal(result.changes, 1);
+  assert.ok(fake.calls.some((c) => c.method === 'DELETE'), '没有删除旧 Gitee 附件');
+  assert.ok(fake.calls.some((c) => c.method === 'POST' && c.url.includes('/attach_files')),
+    '没有重新上传附件');
+}
+{
+  // dry-run 只报告不删除
+  const a = release('v1.0.0');
+  a.assets[0].browser_download_url = 'https://assets.test/github-v1.zip';
+  const b = release('v1.0.0');
+  b.assets[0].browser_download_url = 'https://assets.test/gitee-v1.zip';
+  const fake = mockFetch({ github: [a], gitee: [b], githubAsset: 'NEW', giteeAsset: 'OLD' });
+  globalThis.fetch = fake.fetch;
+  const result = await synchronize({ ...common, replaceAsset: true, dryRun: true });
+  assert.equal(result.changes, 1);
+  assert.equal(fake.calls.some((c) => c.method === 'DELETE' || c.method === 'POST'), false,
+    'dry-run 不得真的删除或上传');
+}
+
+console.log('release sync: 12/12 passed');
