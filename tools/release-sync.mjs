@@ -47,14 +47,15 @@ function authHeaders(token, extra = {}) {
  * 按包体大小给上传类请求留足时间。
  *
  * 发布包从约 1MB 涨到约 10MB（随包分发的 OCR 识别模型），而 GitHub
- * Actions 的 runner 在美西、目标在 Gitee，跨境上传实测只有几十 KB/s：
- * 10MB 的包按 45 秒写死超时必挂，按「每 MB 20 秒」也刚好卡在边界上
- * （实测三次重试各 4 分钟全部超时）。这里给到每 MB 60 秒——
- * 10MB 约 10.6 分钟，按 17KB/s 的保守速度也能传完；封顶 30 分钟。
+ * Actions 的 runner 在美西、目标在 Gitee。实测这段链路分两块时间：
+ *   ① 把字节推上去（受带宽限制，10MB 约 2–4 分钟）；
+ *   ② 推完之后服务端落盘、生成附件，才回响应——静默期可达 5 分钟以上。
+ * 所以上限 = 固定开销 45 秒 + 每 MB 60 秒 + 服务端处理余量 300 秒；
+ * 10MB 约 15.6 分钟，封顶 45 分钟。
  */
 function uploadTimeoutMs(byteLength) {
   const mb = (Number(byteLength) || 0) / (1024 * 1024);
-  return Math.min(1800000, Math.max(45000, Math.ceil(45000 + mb * 60000)));
+  return Math.min(2700000, Math.max(120000, Math.ceil(45000 + mb * 60000 + 300000)));
 }
 
 async function request(url, options = {}, label = 'API 请求', timeoutMs = 45000, allowRetry = false) {
@@ -332,9 +333,9 @@ async function deleteGiteeAsset(owner, repo, token, release, asset) {
  * ——从请求发出到**收到响应头**超过 5 分钟就报 `UND_ERR_HEADERS_TIMEOUT`。
  * Gitee 的 attach_files 要等服务端把 10MB 收完并落盘才回响应，跨境上传
  * 正好卡在 5 分钟上下，于是每次都失败；这个值无法通过 fetch 参数调整。
- * node:https 没有这个内部上限，只有我们自己设的超时：
- *   - 停滞超时：连续 120 秒收不到任何数据才中断（慢但在走就继续）；
- *   - 总时长上限：由调用方按包体大小给出。
+ * node:https 没有这个内部上限，只有我们自己设的总时长上限（按包体大小给出）。
+ * 注意不要在 socket 上设「停滞」超时：字节可能几秒内就全部进了内核缓冲，
+ * 之后要静默等 Gitee 落盘并回响应，这段静默是正常的。
  */
 function httpsPostBuffer(url, headers, body, totalTimeoutMs) {
   return new Promise((resolve, reject) => {
@@ -373,10 +374,11 @@ function httpsPostBuffer(url, headers, body, totalTimeoutMs) {
     const totalTimer = setTimeout(() => {
       req.destroy(new Error(`上传超过 ${Math.round(totalTimeoutMs / 1000)} 秒未完成`));
     }, totalTimeoutMs);
-    // 停滞超时：socket 上连续 120 秒没有任何动静才判死
-    req.setTimeout(120000, () => {
-      req.destroy(new Error('上传停滞超过 120 秒（连续无数据）'));
-    });
+    // 不设 socket 级「停滞」超时：上传字节可能几秒内就全进了内核缓冲，
+    // 之后要静默等 Gitee 落盘并回响应（实测可达 5 分钟以上）。
+    // 这段静默是正常的，用 120 秒的停滞判定会把正常上传误杀。
+    // 真正失控的情况由上面的总时长上限兜底。
+    req.setTimeout(0);
     req.on('error', (e) => finish(reject, e));
     req.end(body);
   });

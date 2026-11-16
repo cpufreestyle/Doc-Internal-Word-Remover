@@ -156,7 +156,9 @@ assert.deepEqual(
   assert.ok(uploadTimeoutMs(10 * MB) > uploadTimeoutMs(1 * MB), '大包的超时必须更长');
   // 跨境实测只有几十 KB/s：10MB 必须给到分钟级，200 秒不够（曾三次各 4 分钟全超时）
   assert.ok(uploadTimeoutMs(10 * MB) >= 500000, '10MB 的包超时至少 500 秒');
-  assert.ok(uploadTimeoutMs(1000 * MB) <= 1800000, '超时要有上限，不能无限长');
+  // 服务端落盘还要静默等 5 分钟以上，10MB 至少要给到 12 分钟
+  assert.ok(uploadTimeoutMs(10 * MB) >= 720000, '10MB 的包要覆盖服务端处理静默期');
+  assert.ok(uploadTimeoutMs(1000 * MB) <= 2700000, '超时要有上限，不能无限长');
 }
 
 // v4.98：Gitee 大附件必须带 Content-Length。
