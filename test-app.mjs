@@ -567,6 +567,18 @@ const D = ctx.window;
         return listed.every((f) => cmd.indexOf(f) >= 0);
       })(),
       'package.json 的 npm test 没有串入目录里的全部测试套件');
+
+    // 发版流程里「先测试、后改写」的顺序不能反：版本注入会把 __DWR_VERSION__
+    // 换成 tag 名，而 v428 门禁断言这个占位符还在。顺序一反，门禁必然误报
+    // （v4.98.1 首次发版就撞上过），测的也不再是即将发布的那份源码。
+    {
+      const RL2 = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'release.yml'), 'utf8');
+      const testAt = RL2.indexOf('Run tests before packaging');
+      const injectAt = RL2.indexOf('Inject version into page');
+      check('v4981-发版流程先跑测试再注入版本号',
+        testAt >= 0 && injectAt >= 0 && testAt < injectAt,
+        'release.yml 里测试步骤缺失，或被放到了版本注入之后');
+    }
   }
 
   // v4.98.1 第三方资源合规门禁：随包分发的 OCR 资源必须带齐许可与来源声明。

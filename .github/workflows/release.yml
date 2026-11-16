@@ -24,6 +24,13 @@ jobs:
         with:
           go-version: '1.23'
 
+      # 测试必须在任何打包改写之前跑：下面的版本注入会把 index.html 里的
+      # __DWR_VERSION__ 占位符替换成 tag 名，而 v428 门禁正是断言这个占位符
+      # 还在（否则 sed 失效后发出去的页面版本号会是空的）。
+      # 先改后测只会让门禁误报，测的也不再是即将发布的那份源码。
+      - name: Run tests before packaging
+        run: npm test
+
       - name: Inject version into page
         run: |
           sed -i "s/__DWR_VERSION__/${GITHUB_REF_NAME}/" index.html
@@ -33,11 +40,6 @@ jobs:
           # 给 启动工具.exe 嵌入程序图标与清单（EXE 在资源管理器 / 任务栏显示的图标）
           go install github.com/akavel/rsrc@latest
           "$(go env GOPATH)/bin/rsrc" -arch 386 -ico assets/app-icon.ico -manifest tools/launcher/app.manifest -o tools/launcher/rsrc_windows_386.syso
-
-      # 打包前必须先过测试：此前只有 push 到 main 才跑 CI，
-      # 理论上可以从一个测试没过的提交打 tag 并发布出去。
-      - name: Run tests before packaging
-        run: npm test
 
       - name: Package web app
         run: |
