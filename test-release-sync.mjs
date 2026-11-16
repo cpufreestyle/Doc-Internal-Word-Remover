@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { compareReleaseTags, synchronize, uploadTimeoutMs } from './tools/release-sync.mjs';
+import { compareReleaseTags, synchronize, uploadTimeoutMs, buildMultipartBody } from './tools/release-sync.mjs';
 
 function release(tag, body = 'michaelqiu 出品') {
   const assetName = `Doc-Internal-Word-Remover-${tag}.zip`;
@@ -140,4 +140,21 @@ assert.deepEqual(
   assert.ok(uploadTimeoutMs(1000 * MB) <= 1800000, '超时要有上限，不能无限长');
 }
 
-console.log('release sync: 8/8 passed');
+// v4.98：Gitee 大附件必须带 Content-Length。
+//   undici 发 FormData 时走 chunked、不带长度，跨境传 10MB 会被中间层重置
+//   （实测报 fetch failed）。这里锁住手工拼的 multipart：
+//   长度可预知、边界闭合、文件字节原样嵌入。
+{
+  const payload = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0x10]);
+  const { body, contentType } = buildMultipartBody('file', 'a-b.zip', payload, 'application/zip');
+  const boundary = /boundary=(.+)$/.exec(contentType)[1];
+  const text = body.toString('latin1');
+  assert.ok(body.length > payload.length, 'multipart 体应包含头尾');
+  assert.ok(text.startsWith('--' + boundary + '\r\n'), '必须以边界开头');
+  assert.ok(text.endsWith('\r\n--' + boundary + '--\r\n'), '必须以闭合边界结尾');
+  assert.ok(text.includes('name="file"'), '字段名丢了');
+  assert.ok(text.includes('filename="a-b.zip"'), '文件名丢了');
+  assert.ok(body.includes(payload), '文件字节必须原样嵌入（二进制不能被转码）');
+}
+
+console.log('release sync: 9/9 passed');

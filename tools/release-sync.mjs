@@ -131,7 +131,7 @@ function normalizeBody(body) {
 
 /** 上传类请求的超时上限：按包体大小给（每 MB 额外 20 秒），
  *  供回归测试直接验证，避免以后又被改回写死的 45 秒。 */
-export { uploadTimeoutMs };
+export { uploadTimeoutMs, buildMultipartBody };
 
 export function compareReleaseTags(left, right) {
   const leftIsHistory = left.startsWith('history-');
@@ -228,22 +228,42 @@ async function uploadGithubAsset(owner, repo, token, release, name, buffer) {
   }, `上传 GitHub 附件 ${name}`, uploadTimeoutMs(buffer.length));
 }
 
-async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log) {
-  const form = new FormData();
-  form.append('file', new Blob([buffer], { type: 'application/zip' }), name);
-  const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
-  // FormData 是一次性的：重试时必须重新构造，否则第二次发的是空 body。
-  const post = () => {
-    const f = new FormData();
-    f.append('file', new Blob([buffer], { type: 'application/zip' }), name);
-    return request(url, {
-      method: 'POST',
-      headers: authHeaders(token),
-      body: f,
-      // 不在这里重试：一次超时已经是十几分钟，重试只会把同样的慢速上传再走一遍。
-      // 定时任务每 30 分钟会重跑一次，天然就是更合适的重试节奏。
-    }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), false);
+/**
+ * 手工拼 multipart/form-data 请求体。
+ *
+ * 为什么不用 FormData：undici 发 FormData 时走 chunked 传输、不带
+ * Content-Length。跨境上传 10MB 到 Gitee 时这种「长度未知」的请求
+ * 会被中间层重置（实测报 `fetch failed`，5 分钟就断）。
+ * 自己拼成 Buffer 后长度是已知的，undici 会带上 Content-Length，
+ * 接收端能按声明长度读满再回包，稳定性明显更好。
+ */
+function buildMultipartBody(fieldName, fileName, fileBuffer, contentType) {
+  const boundary = '----DocInternalWordRemover' + Date.now().toString(16) +
+    Math.random().toString(16).slice(2, 10);
+  const head = Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="${fieldName}"; filename="${fileName}"\r\n` +
+    `Content-Type: ${contentType}\r\n\r\n`, 'utf8');
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+  return {
+    body: Buffer.concat([head, Buffer.from(fileBuffer), tail]),
+    contentType: `multipart/form-data; boundary=${boundary}`,
   };
+}
+
+async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log) {
+  const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
+  const { body, contentType } = buildMultipartBody('file', name, buffer, 'application/zip');
+  const post = () => request(url, {
+    method: 'POST',
+    headers: authHeaders(token, {
+      'Content-Type': contentType,
+      'Content-Length': String(body.length),
+    }),
+    body,
+    // 不在这里重试：一次超时已经是十几分钟，重试只会把同样的慢速上传再走一遍。
+    // 定时任务每 30 分钟会重跑一次，天然就是更合适的重试节奏。
+  }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), false);
   try {
     await post();
   } catch (error) {
