@@ -75,7 +75,14 @@ async function request(url, options = {}, label = 'API 请求', timeoutMs = 4500
       lastError = new Error(`${label}失败（HTTP ${response.status}）：${detail}`);
       if (!canRetry || (response.status < 500 && response.status !== 429)) break;
     } catch (error) {
-      lastError = new Error(`${label}失败：${error.message}`, { cause: error });
+      // fetch 的报错常常只有一句「fetch failed」，真正的原因在 cause 里
+      // （ECONNRESET / UND_ERR_SOCKET / ETIMEDOUT / 证书错误…）。
+      // 不把 cause 带出来，事后只看日志根本判断不了是网络、代理还是请求体问题。
+      const cause = error && error.cause;
+      const detail = cause
+        ? [cause.code, cause.message].filter(Boolean).join(' ') || String(cause)
+        : '';
+      lastError = new Error(`${label}失败：${error.message}` + (detail ? `（${detail}）` : ''), { cause: error });
       if (!canRetry) break;
     }
     if (canRetry && attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
@@ -252,7 +259,7 @@ function buildMultipartBody(fieldName, fileName, fileBuffer, contentType) {
   };
 }
 
-async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log) {
+async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log, retryDelayMs = 15000) {
   const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
   const { body, contentType } = buildMultipartBody('file', name, buffer, 'application/zip');
   const post = () => request(url, {
@@ -262,24 +269,35 @@ async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log =
       'Content-Length': String(body.length),
     }),
     body,
-    // 不在这里重试：一次超时已经是十几分钟，重试只会把同样的慢速上传再走一遍。
-    // 定时任务每 30 分钟会重跑一次，天然就是更合适的重试节奏。
   }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), false);
-  try {
-    await post();
-  } catch (error) {
-    // 超时不一定等于「没传上去」——也可能是传完了但响应没回来。
-    // 先查一次附件列表：已经在就别重传（避免出现同名重复附件）。
-    const releases = await listGiteeReleases(owner, repo, token);
-    const found = releases
-      .map((r) => findExpectedAsset(r, release.tag_name))
-      .find(Boolean);
-    if (found) {
-      log(`上传 Gitee 附件 ${name} 报超时，但附件已存在，按成功处理`);
+
+  // 跨境上传 10MB 实测会出现「跑到四五分钟连接被重置」的情况
+  // （不是我们的超时，底层报 ECONNRESET / UND_ERR_SOCKET），而同一条链路
+  // 重试有时就能过。这里最多试 2 次；每次失败后先查一次附件列表——
+  // 万一其实传成功了只是响应没回来，直接按成功处理，不会出现同名重复附件。
+  const ATTEMPTS = 2;
+  let lastError = null;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+    try {
+      await post();
       return;
+    } catch (error) {
+      lastError = error;
+      const releases = await listGiteeReleases(owner, repo, token).catch(() => []);
+      const found = releases
+        .map((r) => findExpectedAsset(r, release.tag_name))
+        .find(Boolean);
+      if (found) {
+        log(`上传 Gitee 附件 ${name} 报错，但附件已存在，按成功处理`);
+        return;
+      }
+      if (attempt < ATTEMPTS) {
+        log(`上传 Gitee 附件 ${name} 第 ${attempt} 次失败，15 秒后重试：${error.message}`);
+        if (retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      }
     }
-    throw error;
   }
+  throw lastError;
 }
 
 /**
@@ -333,6 +351,7 @@ export async function synchronize({
   dryRun = false,
   updateBody = false,
   replaceAsset = false,
+  retryDelayMs = 15000,
   log = console.log,
 }) {
   const [githubReleases, giteeReleases] = await Promise.all([
@@ -421,7 +440,7 @@ export async function synchronize({
         continue;
       }
       const buffer = await download(githubAsset.browser_download_url, `下载 GitHub 附件 ${currentTag}`);
-      await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log);
+      await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log, retryDelayMs);
       changes += 1;
     } else {
       log(`校验：${currentTag} 附件 SHA256`);
@@ -439,7 +458,7 @@ export async function synchronize({
         }
         const buffer = await download(githubAsset.browser_download_url, `下载 GitHub 附件 ${currentTag}`);
         await deleteGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, giteeAsset);
-        await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log);
+        await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log, retryDelayMs);
         changes += 1;
       }
     }

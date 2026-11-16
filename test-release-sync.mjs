@@ -19,8 +19,9 @@ function release(tag, body = 'michaelqiu 出品') {
   };
 }
 
-function mockFetch({ github, gitee, githubAsset = 'same', giteeAsset = 'same' }) {
+function mockFetch({ github, gitee, githubAsset = 'same', giteeAsset = 'same', attachFailures = 0 }) {
   const calls = [];
+  let attachAttempts = 0;
   return {
     calls,
     fetch: async (url, options = {}) => {
@@ -38,6 +39,11 @@ function mockFetch({ github, gitee, githubAsset = 'same', giteeAsset = 'same' })
       }
       // 任意 release 的附件上传（缺失时创建的是 99，替换已有附件时是 49）
       if (value.includes('/attach_files') && method === 'POST') {
+        attachAttempts += 1;
+        if (attachAttempts <= attachFailures) {
+          // 模拟跨境上传中途被重置：undici 抛 TypeError('fetch failed')，原因在 cause
+          throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET', message: 'socket hang up' } });
+        }
         return Response.json({ name: 'Doc-Internal-Word-Remover-v1.0.0.zip' }, { status: 201 });
       }
       // 删除旧附件（替换附件时才走到）
@@ -202,4 +208,24 @@ assert.deepEqual(
     'dry-run 不得真的删除或上传');
 }
 
-console.log('release sync: 12/12 passed');
+// v4.98.1：跨境上传 10MB 实测会有「跑到四五分钟被重置」的情况（ECONNRESET），
+//   同一条链路重试有时就能过。上传失败后必须自动重试一次，
+//   并且错误信息要带上底层原因（否则日志里只有一句 fetch failed，没法判断）。
+{
+  const a = release('v1.0.0');
+  const fake = mockFetch({ github: [a], gitee: [], attachFailures: 1 });
+  globalThis.fetch = fake.fetch;
+  const result = await synchronize({ ...common, retryDelayMs: 0 });
+  // 变更数 2 = 补建 Gitee Release + 上传附件（与前面的「两边都缺」用例同口径）
+  assert.equal(result.changes, 2, '重试成功后应计为 2 个变更');
+  assert.equal(fake.calls.filter((c) => c.method === 'POST' && c.url.includes('/attach_files')).length, 2,
+    '应在第一次失败后重试一次');
+}
+{
+  // 两次都失败时必须抛错，且信息里带底层原因
+  const a = release('v1.0.0');
+  globalThis.fetch = mockFetch({ github: [a], gitee: [], attachFailures: 5 }).fetch;
+  await assert.rejects(() => synchronize({ ...common, retryDelayMs: 0 }), /ECONNRESET/);
+}
+
+console.log('release sync: 14/14 passed');
