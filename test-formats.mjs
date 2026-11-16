@@ -2680,6 +2680,66 @@ const presetsEngine = D.DWRRules.createEngine({
     JSON.stringify(wideText));
 }
 
+/* ---------------- v4.87：文件类别 / 密级判定（util.js 纯函数） ---------------- */
+{
+  check('v487-文件类别按扩展名判定（doc/xls/ppt/pdf/txt/html）',
+    D.DWRUtil.fileCatOf('a.docx') === 'doc' &&
+    D.DWRUtil.fileCatOf('a.xls') === 'sheet' &&
+    D.DWRUtil.fileCatOf('a.pptx') === 'slide' &&
+    D.DWRUtil.fileCatOf('a.pdf') === 'pdf' &&
+    D.DWRUtil.fileCatOf('a.txt') === 'text' &&
+    D.DWRUtil.fileCatOf('a.html') === 'web',
+    JSON.stringify(['docx', 'xls', 'pptx', 'pdf', 'txt', 'html'].map(D.DWRUtil.fileCatOf)));
+  check('v487-未知扩展名归「其他」',
+    D.DWRUtil.fileCatOf('a.unknownext') === 'other' && D.DWRUtil.fileCatOf('noext') === 'other',
+    JSON.stringify([D.DWRUtil.fileCatOf('a.unknownext'), D.DWRUtil.fileCatOf('noext')]));
+  check('v487-类别多选展开成扩展名集合（可多选）',
+    (function () {
+      var x = D.DWRUtil.catExts(['pdf', 'sheet']);
+      return x.indexOf('pdf') >= 0 && x.indexOf('xlsx') >= 0 && x.indexOf('docx') < 0;
+    })(),
+    JSON.stringify(D.DWRUtil.catExts(['pdf', 'sheet'])));
+  check('v487-「其他」类别不限制扩展名',
+    D.DWRUtil.catExts(['other']) === null,
+    JSON.stringify(D.DWRUtil.catExts(['other'])));
+  check('v487-判定密级取命中词里级别最高的那个',
+    D.DWRUtil.levelOfMatched(['内部', '机密']) === '机密' &&
+    D.DWRUtil.levelOfMatched(['秘密', '绝密']) === '绝密' &&
+    D.DWRUtil.levelOfMatched(['内部']) === '内部',
+    JSON.stringify(D.DWRUtil.levelOfMatched(['内部', '机密'])));
+  check('v487-非密级词不参与密级判定',
+    D.DWRUtil.levelOfMatched(['通知', '通报', '国发']) === '',
+    JSON.stringify(D.DWRUtil.levelOfMatched(['通知', '通报'])));
+  check('v487-越级＝文件密级高于本机定密级',
+    D.DWRUtil.isOverLevel('机密', '秘密') === true &&
+    D.DWRUtil.isOverLevel('内部', '机密') === false &&
+    D.DWRUtil.isOverLevel('机密', '机密') === false &&
+    D.DWRUtil.isOverLevel('', '秘密') === false &&
+    D.DWRUtil.isOverLevel('机密', '') === false,
+    JSON.stringify([
+      D.DWRUtil.isOverLevel('机密', '秘密'),
+      D.DWRUtil.isOverLevel('内部', '机密'),
+      D.DWRUtil.isOverLevel('机密', '机密')
+    ]));
+  check('v487-扫描报告 CSV 多出类别 / 修改时间 / 密级 / 越级列',
+    (function () {
+      var csv = D.DWRUtil.buildScanReportCsv([], [{
+        path: 'a.docx', kind: 'Word', cat: '文字文档', size: '1 KB', mtime: '2026-11-12',
+        hits: 2, matched: '内部 / 机密', ratio: '1.0%', level: '机密', over: '越级存储',
+        mode: '可处理', parts: '', cross: ''
+      }]);
+      var lines = csv.split(/\r?\n/).filter(function (l) { return l && l.charAt(0) !== '#'; });
+      return lines[0].indexOf('cat') >= 0 && lines[0].indexOf('mtime') >= 0 &&
+        lines[0].indexOf('level') >= 0 && lines[0].indexOf('over') >= 0 &&
+        lines[1].indexOf('文字文档') >= 0 && lines[1].indexOf('越级存储') >= 0;
+    })(),
+    JSON.stringify(D.DWRUtil.buildScanReportCsv([], [{
+      path: 'a.docx', kind: 'Word', cat: '文字文档', size: '1 KB', mtime: '2026-11-12',
+      hits: 2, matched: '内部 / 机密', ratio: '1.0%', level: '机密', over: '越级存储',
+      mode: '可处理', parts: '', cross: ''
+    }])));
+}
+
 console.log('\n==== ' + (fail === 0 ? '全部通过' : '存在失败') + ' ====');
 console.log('PASS: ' + pass + '  FAIL: ' + fail);
 process.exit(fail === 0 ? 0 : 1);

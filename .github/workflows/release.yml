@@ -86,7 +86,15 @@ jobs:
             echo "- 命令行按报告脱敏：node scan.mjs --from-report <报告.html|json|txt> --authorized-root <授权目录> --out cleaned。"
             echo ""
             echo "### 质量"
-            echo "本版本已通过 10 个零依赖回归测试套件（\`test-allparts\` / \`test-roundtrip\` / \`test-coverage\` / \`test-concurrency\` / \`test-report\` / \`test-formats\` / \`test-rules\` / \`test-security\` / \`test-app\` / \`test-release-sync\`）。"
+            # 套数与清单从目录里现算，不再写死：写死的那份早已落后于实际
+            # （test-ocr / test-ocr-cli / test-hidden / test-revision-ocr /
+            # test-docx / test-reportxml / test-v494 等都没列进去）。
+            # 口径与 test-app.mjs 的门禁一致：排除需单独起服务的 e2e 与
+            # 真跑外部资源的 *-live（后者不进 npm test）。
+            SUITES=$(ls test-*.mjs | grep -v 'test-e2e\.mjs$' | grep -v -- '-live\.mjs$')
+            SUITE_N=$(echo "$SUITES" | wc -l | tr -d ' ')
+            SUITE_LIST=$(echo "$SUITES" | sed 's/^test-//; s/\.mjs$//' | awk '{printf "%s`%s`", (NR>1?" / ":""), $1}')
+            echo "本版本已通过 ${SUITE_N} 个零依赖回归测试套件（${SUITE_LIST}）。"
           } > notes.md
 
       - name: Guard empty release notes section

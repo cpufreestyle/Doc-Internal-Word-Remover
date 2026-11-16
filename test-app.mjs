@@ -231,7 +231,7 @@ const localStorageStub = {
 /* ---------------- 加载真实引擎 + 真实 app.js ---------------- */
 
 // js/format.js / js/ui.js / js/dircache.js 必须在 app.js 之前：app.js 只保留各自的同名引用
-const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js', 'js/report.js', 'js/format.js', 'js/ui.js', 'js/dircache.js', 'js/undo.js', 'js/reporthtml.js', 'js/app.js'];
+const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js', 'js/report.js', 'js/format.js', 'js/ui.js', 'js/dircache.js', 'js/undo.js', 'js/reporthtml.js', 'js/reportdocx.js', 'js/reportxml.js', 'js/app.js'];
 const code = files.map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n');
 
 const errors = [];
@@ -473,18 +473,31 @@ const D = ctx.window;
     const README2 = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
     const htmlTips = (HTML2.match(/data-tip=/g) || []).length;
     const appTips = (APP2.match(/data-tip=/g) || []).length;
-    check('v477-index.html 悬停说明数锁死为 149（README 同数）',
-      htmlTips === 149, 'htmlTips=' + htmlTips + ' README 写 149');
+    // v4.87：新增类别多选 / 文件名与内容关系 / 本机定密级 3 组控件，各带 1 处说明，149 变为 155；
+    // v4.88：新增「图片文字检查（OCR）」开关 1 处说明，155 变为 156。
+    // v4.91：新增两个「导出 Word」按钮各 1 处说明，156 变为 158。
+    // v4.92：新增两个「导出 XML」按钮各 1 处说明，158 变为 160。
+    // v4.94：新增「跳过选中」「恢复全部跳过」2 处说明，160 变为 162。
+    //   （「本次跳过」是筛选项 <option>，选项本身不承载 data-tip，说明挂在 <select> 上。）
+    check('v477-index.html 悬停说明数锁死为 162（README 同数）',
+      htmlTips === 162, 'htmlTips=' + htmlTips + ' README 写 162');
   const htmlIds = Array.from(HTML2.matchAll(/\sid="([^"]+)"/g), (m) => m[1]);
   const duplicateIds = htmlIds.filter((id, i) => htmlIds.indexOf(id) !== i);
   check('v477-index.html 的 id 全局唯一',
     duplicateIds.length === 0, '重复 id: ' + Array.from(new Set(duplicateIds)).join(', '));
-    check('v459-app.js 动态悬停说明数锁死为 15',
-      appTips === 15, 'appTips=' + appTips + ' README 写 15');
+    // v4.84：扫描结果表新增 3 处动态说明（漏检词 / 多报词 / 检查软件未识别词），
+    // 动态说明数由 15 变为 18。
+    // v4.85：逐词处数比对再加 1 处（「处数不一致」标签），18 变为 19，README 同步更新。
+    // v4.86：文件名中招标签再加 1 处，19 变为 20，README 同步更新。
+    // v4.87：密级标签 + 越级标签 + 密级单元格说明共 3 处，20 变为 23，README 同步更新。
+    // v4.89：命中占比档位标签 1 处，23 变为 24，README 同步更新。
+    // v4.94：「本次跳过」行标签 1 处 + 「原报告」留档标签 1 处，24 变为 26，README 同步更新。
+    check('v459-app.js 动态悬停说明数锁死为 26',
+      appTips === 26, 'appTips=' + appTips + ' README 写 26');
     // README 里的数字必须与代码一致：改一边不改另一边就会误导用户
     check('v459-README 的说明数与代码一致',
-      README2.indexOf('index.html` 的 149 处解释') >= 0
-        && README2.indexOf('动态生成的 15 处') >= 0,
+      README2.indexOf('index.html` 的 162 处解释') >= 0
+        && README2.indexOf('动态生成的 26 处') >= 0,
       'README 与代码不同步');
     check('v476-单栏窄屏优先显示文件区',
       /@media \(max-width: 1080px\) \{[\s\S]*?\.layout > section\.panel-column \{\s*order: 1;/.test(CSS2)
@@ -517,11 +530,43 @@ const D = ctx.window;
     check('v460-README 的词库词数与真实一致',
       !!rdWc && +rdWc[1] === wc,
       'README=' + (rdWc ? rdWc[1] : 'MISSING') + ' 实际=' + wc);
-    // ③ 测试套数：README 数字必须与目录一致（e2e 需单独起服务器，不计入）
-    const listed = fs.readdirSync(__dirname).filter((f) => /^test-.*\.mjs$/.test(f) && f !== 'test-e2e.mjs');
+    // ③ 测试套数：README 数字必须与目录一致。
+    //   e2e 需单独起服务器；*-live 是真跑外部资源的实况用例（要模型、要网络），
+    //   两者都不进 npm test，README 承诺的「N 套」指的是 npm test 实际跑的那些。
+    const listed = fs.readdirSync(__dirname).filter((f) =>
+      /^test-.*\.mjs$/.test(f) && f !== 'test-e2e.mjs' && !/-live\.mjs$/.test(f));
     check('v460-README 的测试套数与目录一致',
       listed.length > 0 && RD.indexOf('一次跑完全部 ' + listed.length + ' 套') >= 0,
       '实际 ' + listed.length + ' 套: ' + listed.join(','));
+  }
+
+  // v4.98 发布链路门禁：CI 与发布说明都不得再各抄一份测试套件清单。
+  //   抄写的那份早就落后于实际——ci.yml 里只列了 10 套，新加的 test-ocr /
+  //   test-ocr-cli / test-hidden / test-revision-ocr / test-docx /
+  //   test-reportxml / test-v494 全都没进去，漏跑的套件等于没有门禁；
+  //   release.yml 的发布说明里也写死了「10 个」，发出去就是假话。
+  //   这里把两者都钉在 package.json 的 npm test 这个唯一事实源上。
+  {
+    const CI = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'ci.yml'), 'utf8');
+    const RL = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'release.yml'), 'utf8');
+    const PK = fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8');
+    check('v498-CI 跑的是 npm test（唯一事实源，不另抄清单）',
+      /npm test/.test(CI) && !/node test-[a-z0-9-]+\.mjs/.test(CI),
+      'ci.yml 里仍有手写的测试套件清单，或没有跑 npm test');
+    check('v498-发布说明的套数从目录现算（不写死）',
+      /SUITE_N/.test(RL) && /ls test-\*\.mjs/.test(RL)
+        && !/已通过 \d+ 个零依赖回归测试套件/.test(RL),
+      'release.yml 里仍写死了测试套件数量');
+    check('v498-npm test 覆盖目录里的全部套件',
+      (() => {
+        const m = /"test":\s*"([^"]+)"/.exec(PK);
+        if (!m) return false;
+        const cmd = m[1];
+        const listed = fs.readdirSync(__dirname).filter((f) =>
+          /^test-.*\.mjs$/.test(f) && f !== 'test-e2e.mjs' && !/-live\.mjs$/.test(f));
+        return listed.every((f) => cmd.indexOf(f) >= 0);
+      })(),
+      'package.json 的 npm test 没有串入目录里的全部测试套件');
   }
   }
 
@@ -3746,7 +3791,10 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
   const SS = (function () {
     // v4.65 起 scanSummary 里多了 fmtRatio(scanArchiveRatio())，只抽它自己就会抛
     // ReferenceError——依赖必须一起抽进来，否则这段行为验证从 v4.65 就是死的。
-    const body = ['fmtRatio', 'scanArchiveRatio', 'skipTotal', 'skipBreakdown', 'scanSummary']
+    // v4.89：概要里多了「标密文件数 / 判定为公开文件数 / 越级存储文件数」，
+    // 依赖 scanArchiveCount 与 rowJudgedPublic，抽函数时必须一起带上。
+    const body = ['fmtRatio', 'scanArchiveRatio', 'scanArchiveCount', 'rowJudgedPublic',
+      'skipTotal', 'skipBreakdown', 'scanSummary']
       .map(sliceFn).join('\n');
     if (body.indexOf('function scanSummary') < 0) return null;
     vm.runInContext(body, SS_CTX);
@@ -4438,7 +4486,7 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
   // 全部测试套 + 网页端源码：参数可能在任意一套里被引用
   // 注意：不能把 scan.mjs 自己算进来——它声明了参数，算进来就永远「被引用」，
   // 门禁会失效（v4.30 第一版就犯了这个错，反向验证时注入新参数也没红）。
-  const SUITES430 = ['test-app.mjs','test-formats.mjs','test-rules.mjs','test-roundtrip.mjs','test-report.mjs','test-coverage.mjs','test-concurrency.mjs','test-allparts.mjs','test-e2e.mjs','js/app.js']
+  const SUITES430 = ['test-app.mjs','test-formats.mjs','test-rules.mjs','test-roundtrip.mjs','test-report.mjs','test-coverage.mjs','test-concurrency.mjs','test-allparts.mjs','test-e2e.mjs','test-revision-ocr.mjs','js/app.js']
     .map((x) => { try { return fs.readFileSync(path.join(__dirname, x), 'utf8'); } catch (e) { return ''; } })
     .join('\n');
   // 从 parseArgs 的 else-if 链抽参数名
@@ -4829,6 +4877,412 @@ const impRowCheck = (n) => impRow(n).children[0].children[0];
     /} else if \(outmode === 'inplace'\) \{[\s\S]{0,240}if \(\$\('backup'\)\.checked\)/.test(SRC),
     'inplace 分支里没有按 backup 决定是否备份');
 }
+
+/* ---------------- v4.84 词级交叉校验：crossCheckWords ----------------
+   导入外部报告后，复检结果要和检查软件报的词逐词比对：
+     漏检 = 检查软件报了、我们没命中 → 清不掉，处理后仍会被报出来；
+     多报 = 我们命中、检查软件没报 → 多半是它词库里没有的词，清掉不影响合规。
+   这两个集合是「准确性」能不能被用户自己验证的关键，必须单独锁住。
+   三个边界：普通扫描行没有对方词集（不校验）；「未知」行对方词集是空的，
+   算多报是错的（我们不知道它看见了什么）。 */
+{
+  const SRCX = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const grabFn = (sig) => {
+    const s = SRCX.indexOf(sig);
+    if (s < 0) return null;
+    let d = 0, e = -1;
+    for (let i = SRCX.indexOf('{', s); i < SRCX.length; i++) {
+      if (SRCX[i] === '{') d++;
+      else if (SRCX[i] === '}') { d--; if (!d) { e = i + 1; break; } }
+    }
+    return e < 0 ? null : SRCX.slice(s, e);
+  };
+  const fns = ['function crossCheckWords(r)', 'function normWordList(list)'];
+  const bodies = fns.map(grabFn);
+  check('v484-词级交叉校验的两个函数都在 app.js 中',
+    bodies.every(Boolean), bodies.map((b, i) => (b ? '' : fns[i])).filter(Boolean).join(','));
+  if (bodies.every(Boolean)) {
+    const ctx2 = { String, Array, Object };
+    ctx2.window = ctx2;
+    vm.createContext(ctx2);
+    vm.runInContext(bodies.join('\n') + '; result = { crossCheckWords: crossCheckWords };', ctx2);
+    const X = ctx2.result;
+
+    // 漏检：检查软件报了「秘密」，我们只命中「内部」
+    const r1 = { fromReport: true, matched: ['内部'], checkerMatched: ['秘密', '内部'] };
+    X.crossCheckWords(r1);
+    check('v484-漏检词被单独列出（清不掉，仍会被报出）',
+      r1.checkerOnlyWords.join(',') === '秘密' && r1.oursOnlyWords.length === 0,
+      JSON.stringify(r1));
+
+    // 多报：我们命中了它词库里没有的词
+    const r2 = { fromReport: true, matched: ['内部', '绝密'], checkerMatched: ['内部'] };
+    X.crossCheckWords(r2);
+    check('v484-多报词被单独列出（清除后不影响合规）',
+      r2.oursOnlyWords.join(',') === '绝密' && r2.checkerOnlyWords.length === 0,
+      JSON.stringify(r2));
+
+    // 两边完全一致：两个集合都为空
+    const r3 = { fromReport: true, matched: ['内部'], checkerMatched: ['内部'] };
+    X.crossCheckWords(r3);
+    check('v484-词集一致时不产生任何标记',
+      r3.checkerOnlyWords.length === 0 && r3.oursOnlyWords.length === 0, JSON.stringify(r3));
+
+    // 「未知」行：对方没给出词集，不能算多报
+    const r4 = { fromReport: true, checkerUnknown: true, matched: ['内部'], checkerMatched: [] };
+    X.crossCheckWords(r4);
+    check('v484-「未知」行不算多报也不算漏检',
+      r4.checkerOnlyWords.length === 0 && r4.oursOnlyWords.length === 0, JSON.stringify(r4));
+
+    // 普通扫描行没有对方词集，不做交叉校验
+    const r5 = { fromReport: false, matched: ['内部'], checkerMatched: [] };
+    X.crossCheckWords(r5);
+    check('v484-普通扫描行不做词级交叉校验',
+      r5.checkerOnlyWords.length === 0 && r5.oursOnlyWords.length === 0, JSON.stringify(r5));
+  }
+
+  // 复检必须与检查软件同口径：外部检查软件按全文检索，复检固定走全文
+  check('v484-复检固定用全文口径（与检查软件同口径）',
+    /function buildRecheckEngine\(\)\s*\{[\s\S]{0,200}?cfg\.scope = 'all'/.test(SRCX),
+    'buildRecheckEngine 没有把 scope 设成 all');
+}
+
+/* ---------------- v4.85 逐词处数比对 ----------------
+   检查软件的报告写「内部(2)」，括号里是该词的出现次数。本工具此前拿
+   「本工具总命中处数」与「检查软件总处数」直接比——本工具词库更宽
+   （多出通知 / 银行 / 公文文号），两个总数不是一个量，几乎每份报告都显示
+   「数量不同」，等于没报。v4.85 改成在检查软件报过的那批词上逐词比处数。
+   这里锁住三件事：逐词处数表算得对、比对只比对方报过的词、复检把
+   本工具的逐词处数写进 ourCounts。 */
+{
+  // v4.84 区块里的 SRCX 是块级作用域，这里读不到，自己读一份。
+  const SRCY = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const grabFn2 = (sig) => {
+    const s = SRCY.indexOf(sig);
+    if (s < 0) return null;
+    let d = 0, e = -1;
+    for (let i = SRCY.indexOf('{', s); i < SRCY.length; i++) {
+      if (SRCY[i] === '{') d++;
+      else if (SRCY[i] === '}') { d--; if (!d) { e = i + 1; break; } }
+    }
+    return e < 0 ? null : SRCY.slice(s, e);
+  };
+  const fns2 = ['function countDiff(r)'];
+  const bodies2 = fns2.map(grabFn2);
+  check('v485-逐词处数比对的函数在 app.js 中',
+    bodies2.every(Boolean), bodies2.map((b, i) => (b ? '' : fns2[i])).filter(Boolean).join(','));
+  if (bodies2.every(Boolean)) {
+    const ctx3 = { String, Array, Object };
+    ctx3.window = ctx3;
+    vm.createContext(ctx3);
+    vm.runInContext(bodies2.join('\n') + '; result = { countDiff: countDiff };', ctx3);
+    const Y = ctx3.result;
+
+    // 同一批词上处数一致 → 无差异
+    const same = { checked: true, checkerCounts: { '内部': 2, '秘密': 1 }, ourCounts: { '内部': 2, '秘密': 1 } };
+    check('v485-同一批词处数一致时不报差异',
+      Y.countDiff(same).length === 0, JSON.stringify(Y.countDiff(same)));
+
+    // 同一个词上处数对不上 → 报出「我们 N 处 / 对方 M 处」
+    const diff = { checked: true, checkerCounts: { '内部': 2 }, ourCounts: { '内部': 5 } };
+    const dd = Y.countDiff(diff);
+    check('v485-同一词处数不一致时被单独列出',
+      dd.length === 1 && dd[0].word === '内部' && dd[0].ours === 5 && dd[0].theirs === 2,
+      JSON.stringify(dd));
+
+    // 对方报了词、我们一个都没命中 → 处数 0 ≠ 对方处数，要报出来
+    const zero = { checked: true, checkerCounts: { '内部': 1 }, ourCounts: {} };
+    check('v485-我们 0 命中而对方报了几处时也要报出差异',
+      Y.countDiff(zero).length === 1 && Y.countDiff(zero)[0].ours === 0, JSON.stringify(Y.countDiff(zero)));
+
+    // 未复检 / 对方没给词集 → 不比对
+    const un = { checked: false, checkerCounts: { '内部': 1 } };
+    check('v485-未复检的行不做处数比对',
+      Y.countDiff(un).length === 0, JSON.stringify(Y.countDiff(un)));
+    const none = { checked: true, ourCounts: { '内部': 1 } };
+    check('v485-没有对方词集时不比对',
+      Y.countDiff(none).length === 0, JSON.stringify(Y.countDiff(none)));
+  }
+
+  // 逐词处数必须真的被统计出来：引擎（rules.js）、纯文本（ooxml.js processText）
+  // 与 OOXML 各部件都要有 counts 表，否则比对时 ours 恒为 0，等于全部报不一致。
+  check('v485-词库引擎按词累计处数',
+    /counts\[c\.label\] = \(counts\[c\.label\] \|\| 0\) \+ 1/.test(fs.readFileSync(path.join(__dirname, 'js', 'rules.js'), 'utf8')),
+    'rules.js 里没有按词累加 counts');
+  check('v485-纯文本与 OOXML 部件都累计逐词处数',
+    /mergeCounts\(counts, r\.counts\)/.test(fs.readFileSync(path.join(__dirname, 'js', 'ooxml.js'), 'utf8')),
+    'ooxml.js 里没有把 r.counts 并进 counts');
+  check('v485-复检时把本工具的逐词处数写进 ourCounts',
+    /r\.ourCounts = res\.counts \|\| \{\}/.test(SRCY),
+    'app.js 复检时没有写 r.ourCounts');
+  // 界面上的「检查软件 N 处」标签要改用逐词比对的结果，而不是两个总数相比
+  check('v485-扫描表用逐词比对结果判断处数是否一致',
+    /var diff = countDiff\(r\)/.test(SRCY) && /处数不一致/.test(SRCY),
+    'app.js 没有用 countDiff 判断处数是否一致');
+}
+/* ---------------- v4.86：复检必须把「文件名」也算进命中 ----------------
+   外部保密检查软件按「文件名 + 正文」一起检索；本工具的文件夹扫描一直把文件名
+   计入命中，但「导入外部报告 → 复检」这条路径只看正文。后果是：
+   名为「内部资料.pdf」「机密合同.docx」的文件正文干净时被算成 0 命中 → 判成误报
+   → 自动隐藏、不处理，文件照原样发出去，检查软件照样报出来。
+   这里锁住两条路径都有文件名扫描，防止以后再各走各的。 */
+{
+  const SRCZ = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const grabBlock = (sig) => {
+    const s = SRCZ.indexOf(sig);
+    if (s < 0) return null;
+    let d = 0, e = -1;
+    for (let i = SRCZ.indexOf('{', s); i < SRCZ.length; i++) {
+      if (SRCZ[i] === '{') d++;
+      else if (SRCZ[i] === '}') { d--; if (!d) { e = i + 1; break; } }
+    }
+    return e < 0 ? null : SRCZ.slice(s, e);
+  };
+  const recheckSrc = grabBlock('async function recheckReportRows(rows, opts)');
+  check('v486-复检路径也要扫文件名', !!recheckSrc && /Doc\.scanFileName\(r\.path/.test(recheckSrc),
+    'app.js 的复检路径没有调用 Doc.scanFileName');
+  check('v486-文件名命中并入总命中处数',
+    !!recheckSrc && /r\.hits \+= nm\.hits/.test(recheckSrc),
+    'app.js 复检时没有把文件名命中的处数并入 r.hits');
+  check('v486-文件名命中也并入逐词处数表（词级比对才对得上）',
+    !!recheckSrc && /r\.ourCounts\[w\] = \(r\.ourCounts\[w\] \|\| 0\) \+ nm\.counts\[w\]/.test(recheckSrc),
+    'app.js 复检时没有把文件名命中的逐词处数并入 r.ourCounts');
+  check('v486-文件夹扫描路径同样扫文件名（两条路径口径一致）',
+    /Doc\.scanFileName\(path, opts\.engine\)/.test(SRCZ),
+    'app.js 的文件夹扫描路径没有扫文件名');
+  // 读不到内容的行不是「复检失败」，而是「正文根本没看」：单独计数、单独提示
+  check('v486-读不到内容的行不再逐条报错',
+    /else if \(!r\.file\) noFile\+\+/.test(SRCZ) && /没读到内容/.test(SRCZ),
+    'app.js 没有对 r.file 为空的行做单独处理');
+  // 实时状态条自带 display:flex，会盖掉 [hidden] 的 display:none——
+// 扫描/导入结束后横幅仍显示过期的「正在扫描…」和「停止」按钮。必须显式兜住。
+  const CSSZ = fs.readFileSync(path.join(__dirname, 'css', 'style.css'), 'utf8');
+  check('v486-实时状态条隐藏时真的不显示',
+    /\.scan-live\[hidden\]\s*\{\s*display:\s*none/.test(CSSZ),
+    'css/style.css 里没有 .scan-live[hidden] { display: none }');
+}
+/* ---------------- 设置版本号一致性：app.js 与 E2E 用例必须写同一个数字 ----------------
+   历史上 SETTINGS_VERSION 升到 4 时，test-e2e.mjs 的断言还写着 3，
+   E2E 长期挂着一条红灯。改 SETTINGS_VERSION 时必须同步改这里，故加测试锁住。 */
+{
+  const appSrc = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const e2eSrc = fs.readFileSync(path.join(__dirname, 'test-e2e.mjs'), 'utf8');
+  const sv = /var SETTINGS_VERSION = (\d+);/.exec(appSrc);
+  const ev = /storedSettings\.settingsVersion !== (\d+)/.exec(e2eSrc);
+  check('v485-E2E 期望的 settingsVersion 与 app.js 的 SETTINGS_VERSION 一致',
+    !!sv && !!ev && sv[1] === ev[1],
+    'app.js=' + (sv ? sv[1] : '未找到') + ' test-e2e=' + (ev ? ev[1] : '未找到'));
+}
+
+/* ---------------- v4.89 涉密分档 / 占比档位 / 复核优先级 ----------------
+   对齐外部保密检查系统的结果表口径：
+     · 「标密文件 / 判定的密级文件 / 判定的公开文件」三档分流
+     · 命中占比分四档（极高 / 高 / 中 / 低）给复核优先级
+     · 每行给出「涉密情况」结论（涉密 / 涉嫌越级存储 / 未标密）
+   口径漂移的后果很实际：报告表格与检查系统对不上，复核顺序也就错了。 */
+{
+  const U = D.DWRUtil;
+  const APP489 = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const UTIL489 = fs.readFileSync(path.join(__dirname, 'js', 'util.js'), 'utf8');
+  const HTML489 = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const CSS489 = fs.readFileSync(path.join(__dirname, 'css', 'style.css'), 'utf8');
+
+  // ① 占比分档：四档边界（≥75% 极高、≥50% 高、≥25% 中、其余 低）
+  check('v489-命中占比分四档（极高 / 高 / 中 / 低）',
+    U.riskTier(0.9) === 'extreme' && U.riskTier(0.75) === 'extreme'
+      && U.riskTier(0.6) === 'high' && U.riskTier(0.5) === 'high'
+      && U.riskTier(0.25) === 'mid' && U.riskTier(0.24) === 'low'
+      && U.riskTier(0.01) === 'low' && U.riskTier(0) === '',
+    JSON.stringify([0.9, 0.75, 0.6, 0.5, 0.25, 0.24, 0.01, 0].map(function (v) { return U.riskTier(v); })));
+  check('v489-占比档位有中文名',
+    U.riskTierLabel('extreme') === '极高' && U.riskTierLabel('high') === '高'
+      && U.riskTierLabel('mid') === '中' && U.riskTierLabel('low') === '低');
+
+  // ② 涉密情况结论：越级最高，其次按判出的密级
+  check('v489-涉密情况结论区分越级 / 涉密 / 未标密',
+    U.secrecyVerdict('机密', true) === '涉嫌越级存储'
+      && U.secrecyVerdict('机密', false) === '涉密（机密）'
+      && U.secrecyVerdict('', false) === '未标密',
+    U.secrecyVerdict('机密', true) + ' | ' + U.secrecyVerdict('机密', false) + ' | ' + U.secrecyVerdict('', false));
+
+  // ③ 筛选与排序：用生产实现跑一遍（从 app.js 抽函数，不在测试里重写口径）
+  function slice489(name) {
+    const k = APP489.indexOf('function ' + name);
+    if (k < 0) return '';
+    let d = 0, e = -1;
+    for (let i = APP489.indexOf('{', k); i < APP489.length; i++) {
+      if (APP489.charAt(i) === '{') d++;
+      else if (APP489.charAt(i) === '}') { d--; if (d === 0) { e = i + 1; break; } }
+    }
+    return APP489.slice(k, e);
+  }
+  const ctx489 = vm.createContext({
+    state: { scanFilterQ: '', scanFilterStatus: 'all', scanSort: 'default', scanResults: [] },
+    scanRowState: function () { return 'hit'; },
+    DWRUtil: U,
+    SCAN_STATUS_LABEL: { secret: '仅看标密', public: '仅看公开' },
+    SCAN_SORT_LABEL: { ratio: '命中占比 高→低', level: '涉密程度 高→低' },
+    $: function () { return null; },
+    console: console,
+  });
+  vm.runInContext(slice489('rowJudgedPublic') + '\n' + slice489('applyScanFilter'), ctx489);
+  const AF489 = ctx489.applyScanFilter;
+  const rows489 = [
+    { path: 'a.docx', level: '机密', ratio: 0.9, hits: 3 },
+    { path: 'b.docx', level: '', ratio: 0.2, hits: 1, checked: true },
+    { path: 'c.docx', level: '', ratio: 0, hits: 0, fromReport: true, handle: null },
+    { path: 'd.docx', level: '', ratio: 0.1, hits: 0, unreadReason: '格式不支持' },
+  ];
+  ctx489.state.scanFilterStatus = 'secret';
+  const sec489 = AF489(rows489);
+  check('v489-标密档只留判出密级的行',
+    sec489.length === 1 && sec489[0].path === 'a.docx', JSON.stringify(sec489.map(function (r) { return r.path; })));
+  ctx489.state.scanFilterStatus = 'public';
+  const pub489 = AF489(rows489);
+  check('v489-公开档不含未复检、读不到正文的行',
+    pub489.length === 1 && pub489[0].path === 'b.docx', JSON.stringify(pub489.map(function (r) { return r.path; })));
+  ctx489.state.scanFilterStatus = 'all';
+  ctx489.state.scanSort = 'ratio';
+  const ratio489 = AF489(rows489);
+  check('v489-可按命中占比从高到低排序',
+    ratio489[0].path === 'a.docx' && ratio489[1].path === 'b.docx',
+    JSON.stringify(ratio489.map(function (r) { return r.path; })));
+  ctx489.state.scanSort = 'level';
+  const lvl489 = AF489(rows489);
+  check('v489-可按涉密程度排序（密级优先、同级比占比）',
+    lvl489[0].path === 'a.docx' && lvl489[1].path === 'b.docx',
+    JSON.stringify(lvl489.map(function (r) { return r.path; })));
+
+  // ④ 导出：CSV 与 HTML 报告都要有涉密情况 / 占比档位两列
+  check('v489-扫描报告 CSV 含涉密情况与占比档位列',
+    /var SCAN_COLS = \[[\s\S]*?'verdict'[\s\S]*?'tier'/.test(UTIL489));
+  check('v489-HTML 报告有涉密情况 / 占比档位列',
+    APP489.indexOf("{ k: 'verdict', label: '涉密情况'") >= 0
+      && APP489.indexOf("{ k: 'tier', label: '占比档位'") >= 0);
+  check('v489-概要含标密 / 公开 / 越级三个计数',
+    APP489.indexOf("'标密文件数'") >= 0 && APP489.indexOf("'判定为公开文件数'") >= 0
+      && APP489.indexOf("'越级存储文件数'") >= 0);
+
+  // ⑤ 界面：筛选档位与排序项都在，档位标签有配色
+  check('v489-结果表可按标密 / 公开分档筛选',
+    HTML489.indexOf('value="secret"') >= 0 && HTML489.indexOf('value="public"') >= 0);
+  check('v489-结果表可按命中占比 / 涉密程度排序',
+    HTML489.indexOf('value="ratio"') >= 0 && HTML489.indexOf('value="level"') >= 0);
+  check('v489-占比单元格带档位标签且标签有配色',
+    /function tierTag\(ratio\)/.test(APP489)
+      && APP489.indexOf('fmtRatio(r.ratio) + tierTag(r.ratio)') >= 0
+      && /\.tag\.tier-extreme/.test(CSS489) && /\.tag\.tier-high/.test(CSS489));
+}
+
+/* ---------------- v4.91 Word 报告导出 ---------------- */
+{
+  const HTML91 = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const APP91 = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const SW91 = fs.readFileSync(path.join(__dirname, 'sw.js'), 'utf8');
+  const DOCX91 = fs.readFileSync(path.join(__dirname, 'js', 'reportdocx.js'), 'utf8');
+
+  check('v491-界面有「导出 Word」按钮（扫描报告 / 清除报告各一个）',
+    HTML91.indexOf('id="scanReportDocxBtn"') >= 0 && HTML91.indexOf('id="reportDocxBtn"') >= 0);
+  check('v491-reportdocx.js 已接入页面与离线缓存',
+    HTML91.indexOf('js/reportdocx.js') >= 0 && SW91.indexOf('./js/reportdocx.js') >= 0);
+  check('v491-两个按钮都绑定了导出动作',
+    APP91.indexOf('exportScanReportDocx') >= 0 && APP91.indexOf('exportCleanReportDocx') >= 0);
+  check('v491-扫描报告的 HTML 与 Word 共用同一份数据模型',
+    APP91.indexOf('function scanReportModel()') >= 0
+      && /DWRReportHtml\.build\(m\.opts\)/.test(APP91)
+      && /DWRReportDocx\.build\(m\.opts\)/.test(APP91));
+  check('v491-docx 模块写全 OOXML 必需部件',
+    DOCX91.indexOf('[Content_Types].xml') >= 0
+      && DOCX91.indexOf('_rels/.rels') >= 0
+      && DOCX91.indexOf('word/document.xml') >= 0
+      && DOCX91.indexOf('word/styles.xml') >= 0);
+  check('v491-docx 走自带 zip 打包器，不引外部依赖',
+    DOCX91.indexOf('DWRZip.pack') >= 0 && /require\(|from\s+['"]/.test(DOCX91) === false);
+}
+
+/* ---------------- v4.92 XML 报告导出 ---------------- */
+{
+  const HTML92 = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const APP92 = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const SW92 = fs.readFileSync(path.join(__dirname, 'sw.js'), 'utf8');
+  const XML92 = fs.readFileSync(path.join(__dirname, 'js', 'reportxml.js'), 'utf8');
+  const README92 = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
+
+  check('v492-界面有「导出 XML」按钮（扫描报告 / 清除报告各一个）',
+    HTML92.indexOf('id="scanReportXmlBtn"') >= 0 && HTML92.indexOf('id="reportXmlBtn"') >= 0);
+  check('v492-reportxml.js 已接入页面与离线缓存',
+    HTML92.indexOf('js/reportxml.js') >= 0 && SW92.indexOf('./js/reportxml.js') >= 0);
+  check('v492-两个按钮都绑定了导出动作',
+    APP92.indexOf('exportScanReportXml') >= 0 && APP92.indexOf('exportCleanReportXml') >= 0);
+  check('v492-扫描报告的 HTML / Word / XML 共用同一份数据模型',
+    APP92.indexOf('function scanReportModel()') >= 0
+      && /DWRReportHtml\.build\(m\.opts\)/.test(APP92)
+      && /DWRReportDocx\.build\(m\.opts\)/.test(APP92)
+      && /DWRReportXml\.build\(m\.opts\)/.test(APP92));
+  check('v492-清除报告三种格式共用一份模型（不再各写一份）',
+    APP92.indexOf('function cleanReportModel()') >= 0
+      && /DWRReportHtml\.build\(m\.opts\)/.test(APP92)
+      && /DWRReportDocx\.build\(m\.opts\)/.test(APP92)
+      && /DWRReportXml\.build\(m\.opts\)/.test(APP92));
+  check('v492-导出的是 XML 文本而不是 HTML 字符串',
+    XML92.indexOf('<InspectionReport') >= 0
+      && XML92.indexOf('application/xml') >= 0
+      && XML92.indexOf('</InspectionReport>') >= 0);
+  check('v492-xml 模块零依赖',
+    /require\(|from\s+['"]/.test(XML92) === false);
+  // 文档同步门禁：新增的导出格式必须写进 README，否则用户根本不知道有这一种
+  check('v492-README 写明了 XML 报告导出',
+    README92.indexOf('XML') >= 0 && README92.indexOf('.xml') >= 0
+      && README92.indexOf('导出 XML') >= 0);
+}
+
+/* ---------------- v4.95：OCR 结果可信度判定 ----------------
+   OCR 会把「机密」认成「ULE」。引擎照样报 0 命中——但那不等于图上干净，
+   只是没认出来。这种文件必须单独标记，不能静默算作「已检查且干净」。
+   判定逻辑放在零依赖模块 js/ocrsuspect.js，浏览器与命令行共用一份。 */
+{
+  const HTML95 = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const SW95 = fs.readFileSync(path.join(__dirname, 'sw.js'), 'utf8');
+  const APP95 = fs.readFileSync(path.join(__dirname, 'js', 'app.js'), 'utf8');
+  const SUS95 = fs.readFileSync(path.join(__dirname, 'js', 'ocrsuspect.js'), 'utf8');
+  const SCAN95 = fs.readFileSync(path.join(__dirname, 'scan.mjs'), 'utf8');
+  const README95 = fs.readFileSync(path.join(__dirname, 'README.md'), 'utf8');
+  const CL95 = fs.readFileSync(path.join(__dirname, 'CHANGELOG.md'), 'utf8');
+
+  check('v495-ocrsuspect.js 存在且导出 check 接口',
+    /DWROcrSuspect/.test(SUS95) && /check\s*:/.test(SUS95),
+    'js/ocrsuspect.js 未导出 check');
+  check('v495-ocrsuspect.js 已接入页面（在 app.js 之前加载）',
+    /<script src="js\/ocrsuspect\.js"><\/script>/.test(HTML95)
+      && HTML95.indexOf('js/ocrsuspect.js') < HTML95.indexOf('js/app.js'),
+    'index.html 未在 app.js 之前加载 ocrsuspect.js');
+  check('v495-ocrsuspect.js 已进离线预缓存清单',
+    /'\.\/js\/ocrsuspect\.js'/.test(SW95),
+    'sw.js 预缓存清单漏了 ocrsuspect.js');
+  check('v495-网页端扫描会调用可信度判定',
+    /DWROcrSuspect/.test(APP95),
+    'app.js 未使用 DWROcrSuspect');
+  check('v495-不可靠结果记入未检查清单（不静默放过）',
+    /'ocr-suspect'/.test(APP95),
+    'app.js 未把 ocr-suspect 记进未检查清单');
+  check('v495-未检查清单里有「OCR 识别不可靠」这一档',
+    /'ocr-suspect':\s*'[^']*OCR/.test(APP95),
+    'SKIP_REASON_LABEL 缺 ocr-suspect 的中文标签');
+  check('v495-命令行同样做可信度判定（同一份模块）',
+    /js\/ocrsuspect\.js/.test(SCAN95) && /DWROcrSuspect/.test(SCAN95),
+    'scan.mjs 未加载/使用 DWROcrSuspect');
+  check('v495-ocrsuspect.js 零依赖',
+    /require\(|from\s+['"]/.test(SUS95) === false,
+    'js/ocrsuspect.js 引了外部依赖');
+  check('v495-README 写明了「识别不可靠不等于干净」',
+    /识别不可靠|认不出|不可靠/.test(README95),
+    'README 未交代 OCR 识别不可靠的处理');
+  check('v495-版本号与 CHANGELOG 顶部一致',
+    JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version
+      === (CL95.match(/^## v(\d+\.\d+\.\d+)/m) || ['', ''])[1],
+    'package.json 与 CHANGELOG 顶部版本不一致');
+}
+
 /* ---------------- 全局不变量：以上任何一节都不得产生运行时错误 ----------------
    fire() 把 app.js handler 的异常收进 handlerErrors、console.error 进 errors；
    收尾统一复查一次，保证全部章节都被这层保护覆盖（v2.37 引入，v2.71 事故后随本章重建）。

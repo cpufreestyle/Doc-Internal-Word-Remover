@@ -81,7 +81,150 @@
 
   /** 报告列定义：`cols` 决定 CSV 表头与每行取值顺序（row[key] 为 undefined 时输出空串） */
   var CLEAN_COLS = ['file', 'hits', 'matched', 'status', 'out'];
-  var SCAN_COLS = ['path', 'kind', 'size', 'hits', 'matched', 'ratio', 'mode', 'parts'];
+  // v4.84：末列 cross = 词级交叉校验结论（漏检 / 多报），导入报告时才有值
+  // v4.87：补 cat（文件类别）/ mtime（修改时间）/ level（判定密级）/ over（是否越级存储）
+  // 新列一律追加在末尾：前几列的顺序是既有约定（用户的脚本按位置取列），插在中间会打断下游
+  var SCAN_COLS = ['path', 'kind', 'size', 'hits', 'matched', 'ratio', 'mode', 'parts', 'cross',
+    'cat', 'mtime', 'level', 'over', 'verdict', 'tier',
+    // v4.94：外部检查系统报告里的原结论（导入报告时才有值），随报告一并导出，
+    //   交出去时能同时看到「检查软件怎么说」与「本工具怎么说」。
+    'ctime', 'checkerRatio', 'checkerMarkLevel', 'checkerVerdict', 'checkerCat'];
+
+  /* ---------------- v4.87：文件类别 / 密级判定 ----------------
+     外部保密检查系统的「文件涉密信息检查」有两个维度我们此前只做了一半：
+       1) 检查文件类型按类目多选（doc / xls / ppt / pdf / txt / html / wps / et …）；
+       2) 文件密级 vs 本机定密级——文件密级高于本机即「越级存储」。
+     这里把两套口径做成纯函数，界面扫描、报告导出、命令行扫描共用同一份定义。 */
+
+  /** 文件类别定义：key 用于勾选，exts 展开成实际扩展名过滤集 */
+  var FILE_CATS = [
+    { key: 'doc', label: '文字文档', exts: ['docx', 'docm', 'dotx', 'dotm', 'doc', 'dot', 'rtf', 'odt', 'wps', 'wpsx', 'wpt'] },
+    { key: 'sheet', label: '表格', exts: ['xlsx', 'xlsm', 'xltx', 'xltm', 'xls', 'xlt', 'csv', 'tsv', 'et', 'ods'] },
+    { key: 'slide', label: '演示', exts: ['pptx', 'pptm', 'potx', 'potm', 'ppsx', 'ppsm', 'ppt', 'pot', 'pps', 'dps', 'odp'] },
+    { key: 'pdf', label: 'PDF', exts: ['pdf'] },
+    { key: 'text', label: '文本', exts: ['txt', 'text', 'md', 'markdown', 'rst', 'tex', 'log', 'lst', 'nfo', 'me', 'sub', 'srt', 'vtt', 'ini', 'cfg', 'conf', 'config', 'properties', 'env', 'yml', 'yaml', 'toml', 'json', 'jsonl', 'xml', 'sql', 'reg'] },
+    { key: 'web', label: '网页', exts: ['html', 'htm', 'xhtml', 'mht', 'svg'] },
+    { key: 'code', label: '源码脚本', exts: ['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'vue', 'svelte', 'py', 'java', 'kt', 'kts', 'scala', 'groovy', 'c', 'h', 'cpp', 'cc', 'cxx', 'hpp', 'cs', 'go', 'rs', 'rb', 'php', 'pl', 'lua', 'r', 'swift', 'dart', 'css', 'scss', 'less', 'styl', 'sh', 'bash', 'zsh', 'bat', 'cmd', 'ps1', 'vbs'] },
+    { key: 'zip', label: '压缩包', exts: ['zip', 'zipx', 'jar', 'apk', 'xpi', 'epub', 'whl', 'nupkg', 'rar', '7z'] },
+    { key: 'other', label: '其他', exts: [] }
+  ];
+
+  /** 取扩展名（小写，无点） */
+  function extOf(name) {
+    var s = String(name || '');
+    var i = s.lastIndexOf('.');
+    if (i < 0) return '';
+    var e = s.slice(i + 1).toLowerCase();
+    return /^[a-z0-9]{1,12}$/.test(e) ? e : '';
+  }
+
+  /** 文件所属类别（未知扩展名归「其他」） */
+  function fileCatOf(name) {
+    var e = extOf(name);
+    if (!e) return 'other';
+    for (var i = 0; i < FILE_CATS.length; i++) {
+      if (FILE_CATS[i].exts.indexOf(e) >= 0) return FILE_CATS[i].key;
+    }
+    return 'other';
+  }
+
+  /** 类别 key → 中文名 */
+  function fileCatLabel(key) {
+    for (var i = 0; i < FILE_CATS.length; i++) {
+      if (FILE_CATS[i].key === key) return FILE_CATS[i].label;
+    }
+    return '其他';
+  }
+
+  /**
+   * 按勾选的类别展开成扩展名集合。
+   * 勾了「其他」表示不限制（返回 null，等同「全部支持格式」）。
+   */
+  function catExts(keys) {
+    var list = (keys || []).filter(function (k) { return k && k !== 'other'; });
+    if (!list.length) return null;
+    var out = [];
+    list.forEach(function (k) {
+      FILE_CATS.forEach(function (c) {
+        if (c.key === k) c.exts.forEach(function (e) { if (out.indexOf(e) < 0) out.push(e); });
+      });
+    });
+    return out.length ? out : null;
+  }
+
+  /* ---------------- 密级判定 ----------------
+     密级词本身带级别信息：绝密 > 机密 > 秘密 > 内部。
+     文件密级 = 命中词里级别最高的那个；与「本机定密级」相比高出的即为「越级存储」。 */
+
+  var SECRET_LEVELS = ['公开', '内部', '秘密', '机密', '绝密']; // 由低到高
+
+  /** 命中词 → 文件判定密级（无密级词则空串） */
+  function levelOfMatched(matched) {
+    var best = '';
+    (matched || []).forEach(function (w) {
+      var t = String(w == null ? '' : w).trim();
+      if (t === '公开') return;                 // 「公开」是定密级用词，不是命中出来的
+      if (SECRET_LEVELS.indexOf(t) < 0) return;
+      if (SECRET_LEVELS.indexOf(t) > SECRET_LEVELS.indexOf(best)) best = t;
+    });
+    return best;
+  }
+
+  /** 密级序（越大越密）；无法识别返回 -1 */
+  function levelRank(level) {
+    var i = SECRET_LEVELS.indexOf(String(level || '').trim());
+    return i < 0 ? -1 : i;
+  }
+
+  /** 文件密级是否高于本机定密级（越级存储） */
+  function isOverLevel(fileLevel, machineLevel) {
+    var a = levelRank(fileLevel), b = levelRank(machineLevel);
+    return a > 0 && b >= 0 && a > b;
+  }
+
+  /* ---------------- v4.89：涉密分档 ----------------
+     外部保密检查系统的结果表除了「命中百分比」，还按百分比把文件分成四档
+     （实测其报告里的占比只有 25% / 50% / 75% / 100% 四种取值），
+     并用「标密文件 / 判定的密级文件 / 判定的公开文件」三个页签分流。
+     我们不把占比压成四档（连续值信息更多），但沿用它按四档给结论的做法：
+     占比越高，复核优先级越高，界面上直接给出档位，人工不用自己换算。 */
+
+  var RISK_TIERS = [
+    { min: 0.75, key: 'extreme', label: '极高' },
+    { min: 0.5, key: 'high', label: '高' },
+    { min: 0.25, key: 'mid', label: '中' },
+    { min: 0.0001, key: 'low', label: '低' }
+  ];
+
+  /** 命中占比 → 档位 key（无有效占比返回空串） */
+  function riskTier(ratio) {
+    var v = Number(ratio);
+    if (!isFinite(v) || v <= 0) return '';
+    for (var i = 0; i < RISK_TIERS.length; i++) {
+      if (v >= RISK_TIERS[i].min) return RISK_TIERS[i].key;
+    }
+    return '';
+  }
+
+  /** 档位 key → 中文名 */
+  function riskTierLabel(key) {
+    for (var i = 0; i < RISK_TIERS.length; i++) {
+      if (RISK_TIERS[i].key === key) return RISK_TIERS[i].label;
+    }
+    return '';
+  }
+
+  /**
+   * 涉密情况结论（对应外部保密检查系统结果表的「涉密情况」列）。
+   * 越级存储 → 涉嫌越级存储；判出密级 → 涉密（X 级）；其余 → 未标密。
+   * 注意：「未标密」只说明文件里没有密级标识词，不代表文件可以对外发，
+   * 报告里仍按人工判定清单走。
+   */
+  function secrecyVerdict(level, over) {
+    if (over) return '涉嫌越级存储';
+    var lv = String(level || '').trim();
+    return lv ? ('涉密（' + lv + '）') : '未标密';
+  }
 
   /**
    * 通用 CSV 报告构造：CRLF 行尾 + 行首 `#` 元信息注释行，Excel 双击可直接打开。
@@ -137,6 +280,17 @@
     mapPool: mapPool,
     suggestedConcurrency: suggestedConcurrency,
     csvCell: csvCell,
+    FILE_CATS: FILE_CATS,
+    SECRET_LEVELS: SECRET_LEVELS,
+    fileCatOf: fileCatOf,
+    fileCatLabel: fileCatLabel,
+    catExts: catExts,
+    levelOfMatched: levelOfMatched,
+    levelRank: levelRank,
+    isOverLevel: isOverLevel,
+    riskTier: riskTier,
+    riskTierLabel: riskTierLabel,
+    secrecyVerdict: secrecyVerdict,
     buildReportCsv: buildReportCsv,
     buildReportJson: buildReportJson,
     buildCleanReportCsv: buildCleanReportCsv,

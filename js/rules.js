@@ -608,6 +608,9 @@
       var hits = 0;
       var hitChars = 0;
       var matched = [];
+      // v4.85：逐词命中处数。外部保密检查软件报的「内部(2)」就是这个量，
+      // 只有拿到同一口径的逐词数，才能把两边的处数直接比。
+      var counts = {};
       if (!combined) {
         var out0 = text;
         compiled.forEach(function (c) {
@@ -617,10 +620,11 @@
             hits++;
             hitChars += m.length;
             if (matched.indexOf(c.label) === -1) matched.push(c.label);
+            counts[c.label] = (counts[c.label] || 0) + 1;
             return repl(m, c.label);
           });
         });
-        return { text: out0, hits: hits, hitChars: hitChars, matched: matched, atFirst: first, atLast: last };
+        return { text: out0, hits: hits, hitChars: hitChars, matched: matched, counts: counts, atFirst: first, atLast: last };
       }
       var out = text.replace(combined, function () {
         var m = arguments[0];
@@ -634,9 +638,10 @@
         hits++;
         hitChars += m.length;
         if (matched.indexOf(label) === -1) matched.push(label);
+        counts[label] = (counts[label] || 0) + 1;
         return repl(m, label);
       });
-      return { text: out, hits: hits, hitChars: hitChars, matched: matched, atFirst: first, atLast: last };
+      return { text: out, hits: hits, hitChars: hitChars, matched: matched, counts: counts, atFirst: first, atLast: last };
     }
 
     /**
@@ -675,6 +680,8 @@
       var hits = 0;
       var hitChars = 0;
       var matched = [];
+      // v4.85：逐词命中处数（与 applyFast 同一口径）
+      var counts = {};
       spans.forEach(function (sp) {
         var os = map[sp.s];
         // 区间右端取「最后一个命中字符」的原文末尾：夹在命中字符之间的不可见字符
@@ -685,15 +692,16 @@
         hits++;
         hitChars += norm.slice(sp.s, sp.e).length;
         if (matched.indexOf(sp.label) === -1) matched.push(sp.label);
+        counts[sp.label] = (counts[sp.label] || 0) + 1;
       });
       out += text.slice(cursor);
-      return { text: out, hits: hits, hitChars: hitChars, matched: matched, atFirst: first, atLast: last };
+      return { text: out, hits: hits, hitChars: hitChars, matched: matched, counts: counts, atFirst: first, atLast: last };
     }
 
     /** 仅统计，不修改 */
     function scan(text, isFirst, isLast) {
       var r = apply(text, isFirst, isLast);
-      return { hits: r.hits, hitChars: r.hitChars, matched: r.matched, atFirst: r.atFirst, atLast: r.atLast };
+      return { hits: r.hits, hitChars: r.hitChars, matched: r.matched, counts: r.counts, atFirst: r.atFirst, atLast: r.atLast };
     }
 
     return {

@@ -39,6 +39,8 @@
  *  node scan.mjs --from-report report.json --authorized-root "D:\资料" --pick 路径 --delete --confirm-delete
  *       --delete 默认只演练；实际删除必须同时提供 --confirm-delete。
  *
+ *   node scan.mjs --drive D: --ocr         对文档插图 / 截图 / 扫描件 PDF 做本地 OCR，把图上的密级标识也纳入检索
+ *       --ocr 需要本机已装 tesseract.js（npm install）；识别模型随工具分发，不联网。
  * 说明：纯报告模式只读不写；--clean 会把命中文档的脱敏版本写入 --out（镜像目录结构）。
  *       支持 Office OOXML 全部变体：docx/docm/dotx/dotm、xlsx/xlsm/xltx/xltm、pptx/pptm/potx/potm/ppsx/ppsm。
  *       默认跳过 Windows / Program Files / node_modules 等系统/依赖目录以提速减噪。
@@ -214,7 +216,7 @@ function pickReportFiles(list, o) {
 }
 
 async function loadEngine() {
-  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js', 'js/report.js'];
+  const files = ['js/zip.js', 'js/rules.js', 'js/pdf.js', 'js/ooxml.js', 'js/util.js', 'js/report.js', 'js/ocrsuspect.js'];
   const code = files
     .map((f) => fs.readFileSync(path.join(__dirname, f), 'utf8'))
     .join('\n');
@@ -232,7 +234,7 @@ async function loadEngine() {
 }
 
 function parseArgs(argv) {
-  const o = { drive: null, dirs: [], out: null, clean: false, json: false, limit: Infinity, depth: Infinity, concurrency: 8, maxFileMb: 0, ext: null, shard: null, skipSystem: true, docsOnly: false, exclude: [], fromReport: null, root: null, authorizedRoots: [], allowNetworkPaths: false, confirmNetworkPaths: false, confirmDelete: false, action: 'delete', custom: '', report: null, scope: 'firstlast', html: false, htmlFile: null, moveTo: null, moveDryRun: false, delete: false, deleteDryRun: false, words: null, nameWords: null, nameMode: 'or', whole: false, excludeCtx: [], caseSensitive: false, verify: false, pick: [], pickWord: [], pickDir: [], pickList: null, inPlace: false, backup: true, deleteBak: false };
+  const o = { drive: null, dirs: [], out: null, clean: false, json: false, limit: Infinity, depth: Infinity, concurrency: 8, maxFileMb: 0, ext: null, shard: null, skipSystem: true, docsOnly: false, exclude: [], fromReport: null, root: null, authorizedRoots: [], allowNetworkPaths: false, confirmNetworkPaths: false, confirmDelete: false, action: 'delete', custom: '', report: null, scope: 'firstlast', html: false, htmlFile: null, moveTo: null, moveDryRun: false, delete: false, deleteDryRun: false, words: null, nameWords: null, nameMode: 'or', whole: false, excludeCtx: [], caseSensitive: false, verify: false, pick: [], pickWord: [], pickDir: [], pickList: null, inPlace: false, backup: true, deleteBak: false, ocr: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--drive') o.drive = argv[++i];
@@ -258,6 +260,7 @@ function parseArgs(argv) {
     else if (a === '--allow-network-paths') o.allowNetworkPaths = true;
     else if (a === '--confirm-network-paths') o.confirmNetworkPaths = true;
     else if (a === '--action') o.action = argv[++i];
+    else if (a === '--ocr') o.ocr = true;
     else if (a === '--custom') o.custom = argv[++i];
     else if (a === '--scope') o.scope = String(argv[++i] || '').toLowerCase();
     else if (a === '--html') { o.html = true; const nv = argv[i + 1]; if (nv && !nv.startsWith('--')) o.htmlFile = argv[++i]; }
@@ -322,13 +325,43 @@ function pathInside(root, target) {
   return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
 }
 
+/** realpath 失败时的两种语义要分开：
+ *   ENOENT / ENOTDIR —— 路径还没建出来，往上一级找就行（下面继续向上找已存在的祖先）。
+ *   EACCES / EPERM    —— 路径确实存在，但当前账号无权解析（典型是 C:\Program Files\WindowsApps
+ *                        这类由 TrustedInstaller 掌控的目录，realpath 会直接被 ACL 拒绝）。
+ *                        这类路径不能当成「不存在」往上糊弄——它可能是符号链接指向别处，
+ *                        绕过去就等于跳过了一道安全检查。正确做法是明确标记为「无法验证」。
+ */
+function isMissingPathError(e) {
+  return e && (e.code === 'ENOENT' || e.code === 'ENOTDIR');
+}
+
+/** 真实路径无法解析（存在但无权限查看）时的标记 */
+const UNVERIFIABLE = Symbol('unverifiable');
+
+/** --ocr 的 tesseract worker（模块级，便于退出前收尾）
+ *  v4.93：worker 是常驻子进程 / 线程，不显式 terminate 的话 Node 不会退出——
+ *  扫描早就跑完、报告也写好了，进程却一直挂着，整盘批处理会被卡在这一步。 */
+let ocrWorker = null;
+
+/** 收掉 OCR worker，让进程能正常退出 */
+async function shutdownOcrWorker() {
+  if (!ocrWorker) return;
+  const w = ocrWorker;
+  ocrWorker = null;
+  try { await w.terminate(); } catch (e) { /* 收尾失败不该影响扫描结论 */ }
+}
+
 /** 对尚不存在的路径也做 canonical 化：解析最近的已存在父目录，再接回剩余段。 */
 async function canonicalForCheck(p) {
   const abs = path.resolve(p);
   try {
     return await fsp.realpath(abs);
   } catch (e) {
-    if (!e || (e.code !== 'ENOENT' && e.code !== 'ENOTDIR')) throw e;
+    if (!isMissingPathError(e)) {
+      if (e && (e.code === 'EACCES' || e.code === 'EPERM')) return UNVERIFIABLE;
+      throw e;
+    }
   }
   let cursor = abs;
   const tail = [];
@@ -341,7 +374,10 @@ async function canonicalForCheck(p) {
       const realParent = await fsp.realpath(cursor);
       return path.join(realParent, ...tail);
     } catch (e) {
-      if (!e || (e.code !== 'ENOENT' && e.code !== 'ENOTDIR')) throw e;
+      if (!isMissingPathError(e)) {
+        if (e && (e.code === 'EACCES' || e.code === 'EPERM')) return UNVERIFIABLE;
+        throw e;
+      }
     }
   }
 }
@@ -362,19 +398,35 @@ async function authorizeReportFiles(items, options) {
   const roots = [];
   for (const raw of options.authorizedRoots) {
     const real = await canonicalForCheck(raw);
+    if (real === UNVERIFIABLE) {
+      throw new Error('无法解析授权根的真实路径（权限受限）：' + raw);
+    }
     const st = await fsp.stat(real);
     if (!st.isDirectory()) throw new Error('授权根不是目录: ' + raw);
     roots.push(real);
   }
   const offenders = [];
+  // 权限受限、无法验证真实路径的条目：不是「越界」，而是「查不到」。
+  // 外部检查软件的报告里混着系统目录（WindowsApps / Program Files 等）很常见，
+  // 过去 realpath 抛 EPERM 会把整批打断；现在单独归类、跳过并提示，不影响其余条目。
+  const unverifiable = [];
   for (const item of items) {
     const real = await canonicalForCheck(item.file);
+    if (real === UNVERIFIABLE) { unverifiable.push(item.file); continue; }
     if (!roots.some((root) => pathInside(root, real))) offenders.push(item.file);
     else item.file = real;
   }
   if (offenders.length) {
     throw new Error('报告中有 ' + offenders.length + ' 个路径不在授权根内，已拒绝全部操作。示例: '
       + offenders.slice(0, 3).join(' | '));
+  }
+  if (unverifiable.length) {
+    console.log('提示: 报告中有 ' + unverifiable.length + ' 个路径位于权限受限的系统目录'
+      + '（如 WindowsApps / Program Files），无法验证真实路径，已跳过这些条目。示例: '
+      + unverifiable.slice(0, 3).join(' | '));
+  }
+  for (const item of items) {
+    if (unverifiable.includes(item.file)) item.skip = true;
   }
   return roots;
 }
@@ -741,6 +793,137 @@ async function main() {
     caseSensitive: o.caseSensitive,
   });
 
+  /* ---------------- 图片文字检查（OCR）----------------
+   *
+   * 图上的密级标识正文层里根本没有：扫描件 PDF、文档里插的截图、独立的图片文件，
+   * 按文本口径全是「干净文件」，外部保密检查软件却照样会报出来。
+   * 浏览器端已经能 OCR（界面上的「图片文字检查」开关），命令行这一侧此前完全没有——
+   * 整盘批量排查时正好是最容易漏的一类。这里补上：--ocr 走本机 tesseract.js，
+   * 模型随工具分发（assets/ocr），不联网、不上传任何图片。
+   *
+   * 缺依赖时必须明确说「没做」而不是静默跳过：用户以为整盘查过了，
+   * 实际图片文字一个字没看，下次检查照样中招。
+   */
+  const ocrState = { engine: null, files: 0, images: 0, hits: 0, suspect: 0, enabled: false };
+  // v4.95：OCR 认出来的东西不可信、又没命中任何密级词的文件。
+  // 「命中 0」不等于干净——这些文件单列出来，提示人工看图。
+  const ocrSuspectFiles = [];
+  if (o.ocr) {
+    ocrState.enabled = true;
+    try {
+      const { createWorker } = await import('tesseract.js');
+      const langPath = path.join(__dirname, 'assets', 'ocr', 'lang');
+      const worker = await createWorker('chi_sim+eng', 1, {
+        langPath,
+        gzip: true,
+        logger: () => { },
+      });
+      // OCR 用「全文」口径的引擎：图上的字不分行，清理范围（首行 / 尾行）只约束改写，
+      // 检测阶段一律全文检索——否则图里的「内部」在第二行就漏了。
+      ocrState.engine = D.DWRRules.createEngine({
+        rules: rules,
+        scope: 'all', action: o.action, custom: o.custom,
+        caseSensitive: o.caseSensitive,
+      });
+      ocrState.worker = worker;
+      ocrWorker = worker;
+      console.log('[OCR] 已启用图片文字检查（本地识别，不联网）');
+    } catch (e) {
+      console.error('[提示] --ocr 需要本机已安装 tesseract.js（npm install），本次未做图片文字检查：'
+        + String((e && e.message) || e));
+      console.error('[提示] 未做 OCR 的图片 / 扫描件仍需人工复核，否则整盘结论不完整。');
+    }
+  }
+
+  /**
+   * 命中部位名：「图片OCR（部件名）」。
+   * 部件名本身可能已经带括号（独立图片文件叫「（图片文件）」），直接拼会变成
+   * 「图片OCR（（图片文件））」这种双层括号——不影响命中，但读着别扭。
+   */
+  function ocrPartLabel(part) {
+    var p = String(part || '图片').trim();
+    if (!p) p = '图片';
+    // 已经自带圆括号就别再套一层
+    if (/^[（(].*[）)]$/.test(p)) return p;
+    return '（' + p + '）';
+  }
+
+  /**
+   * 取出文件里的图并识别，按同一套词库算命中。
+   * 命中部位写成「图片OCR（部件名）」，与正文命中分开记账，方便回溯到具体哪张图。
+   * @returns {Promise<{hits:number, hitChars:number, totalChars:number, matched:string[], parts:Array}>}
+   */
+  async function ocrScanFileRaw(full, buf) {
+    const res = { hits: 0, hitChars: 0, totalChars: 0, matched: [], parts: [], suspects: [] };
+    if (!ocrState.worker) return res;
+    const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    const ext = (String(full || '').split('.').pop() || '').toLowerCase();
+    let images = [];
+    try {
+      if (/^(png|jpe?g|bmp|gif|tiff?|webp)$/.test(ext)) {
+        images = [{ part: '（图片文件）', bytes: bytes }];
+      } else if (D.DWRPdf && D.DWRPdf.extractImages && D.DWRDoc.isPdfBytes(bytes)) {
+        images = D.DWRPdf.extractImages(bytes) || [];
+      } else if (D.DWRDoc.extractImages) {
+        images = await D.DWRDoc.extractImages(full, bytes);
+      }
+    } catch (e) {
+      images = [];
+    }
+    if (!images.length) return res;
+    ocrState.files++;
+    for (const img of images) {
+      let r;
+      try {
+        const out = await ocrState.worker.recognize(img.bytes);
+        r = { text: String((out && out.data && out.data.text) || ''), confidence: (out && out.data && out.data.confidence) || 0 };
+      } catch (e) {
+        console.log('[OCR 失败] ' + (img.part || '图片') + '：' + String((e && e.message) || e));
+        continue;
+      }
+      if (!r.text) continue;
+      ocrState.images++;
+      // v4.95：识别文本能不能拿来断言「图上没有密级标识」，要单独判一次。
+      // 中文被认成拉丁字母（「机密」→「ULE」）时引擎会报 0 命中——
+      // 那不是干净，只是没认出来。这种文件不能静默算成已查。
+      let suspect = null;
+      try {
+        if (D.DWROcrSuspect) suspect = D.DWROcrSuspect.check(r.text);
+      } catch (e) { suspect = null; }
+      if (suspect && !suspect.ok) {
+        res.suspects = res.suspects.concat(suspect.reasons);
+        ocrState.suspect++;
+      }
+      const sc = ocrState.engine.scan(r.text);
+      if (!sc || !sc.hits) continue;
+      res.hits += sc.hits;
+      res.hitChars += sc.hitChars || 0;
+      res.totalChars += r.text.replace(/\s/g, '').length;
+      (sc.matched || []).forEach((w) => { if (res.matched.indexOf(w) < 0) res.matched.push(w); });
+      res.parts.push({
+        name: '图片OCR' + ocrPartLabel(img.part),
+        label: '图片OCR' + ocrPartLabel(img.part),
+        hits: sc.hits, matched: (sc.matched || []).slice(),
+      });
+    }
+    ocrState.hits += res.hits;
+    return res;
+  }
+
+  /* v4.95：OCR 结果不可信的文件单列出来。
+   * 认错的中文（「机密」→「ULE」）会让引擎报 0 命中——那不是干净，只是没认出来。
+   * 命令行没有界面上的「未检查清单」，所以这里用单独一行提示 + 路径清单兜住。 */
+  async function ocrScanFile(full, buf) {
+    const res = await ocrScanFileRaw(full, buf);
+    if (res.suspects && res.suspects.length && res.hits === 0) {
+      ocrSuspectFiles.push(full);
+      console.log('[OCR 不可靠] ' + full
+        + '\n       ' + res.suspects.map((s) => s.detail).join('；')
+        + '\n       未能据此判定该文件干净，需人工看图');
+    }
+    return res;
+  }
+
   // 报告模式：按已有命中清单处理指定文件。三种去处：
   //   默认   → 生成脱敏副本到 --out（原文件不动）
   //   --in-place → 就地脱敏，直接改写原文件（默认先备份 .bak）
@@ -840,6 +1023,9 @@ async function main() {
 
     await mapPool(list, conc, async (item) => {
       try {
+        // v4.90：权限受限目录里的路径无法验证真实路径（见 authorizeReportFiles），
+        //   跳过即可——这些条目本来就读不到，也不该被写回或删除。
+        if (item.skip) { skip++; return; }
         if (!D.DWRDoc.isSupported(item.file)) {
           // 旧版 Office 可只读检测，但报告清理模式要写回内容——做不到，单独计数并提示转存
           if (D.DWRDoc.isDetectableOnly(item.file)) legacyOnly++; else unsupported++;
@@ -1177,20 +1363,61 @@ async function main() {
       return res;
     };
 
+    // 独立图片文件：没有正文层，全部结论来自 OCR
+    if (ocrState.enabled && D.DWRDoc.isImageFile(full)) {
+      const ocr = await ocrScanFile(full, buf);
+      const res = { hits: ocr.hits, hitChars: ocr.hitChars, totalChars: ocr.totalChars, ratio: ocr.totalChars > 0 ? ocr.hitChars / ocr.totalChars : 0, matched: ocr.matched, parts: ocr.parts, firstHit: false, lastHit: false, touched: ocr.hits > 0, outAb: null, outBuf: null, detectOnly: true };
+      return nameHit(res);
+    }
     if (D.DWRDoc.isOfficeFile(full)) {
       if (o.clean) {
         const res = await D.DWRDoc.processOffice(ab, engine);
+        // OCR 命中只参与检测：图上的字没法原地改写（图像是位图，不是文本层）。
+        // 这里仍要把 OCR 的命中并进结果，否则「扫到了图里的机密却没报」等于没扫。
+        if (ocrState.enabled) {
+          const ocr = await ocrScanFile(full, buf);
+          if (ocr.hits) {
+            res.hits += ocr.hits;
+            res.hitChars = (res.hitChars || 0) + ocr.hitChars;
+            res.totalChars = (res.totalChars || 0) + ocr.totalChars;
+            (ocr.matched || []).forEach((w) => { if (res.matched.indexOf(w) < 0) res.matched.push(w); });
+            res.parts = (res.parts || []).concat(ocr.parts || []);
+          }
+        }
         const outAb = res.touched && res.blob ? await res.blob.arrayBuffer() : null;
         return { hits: res.hits, hitChars: res.hitChars || 0, totalChars: res.totalChars || 0, ratio: res.ratio || 0, matched: res.matched, firstHit: res.firstHit, lastHit: res.lastHit, touched: res.touched, outAb, outBuf: null };
       }
-      const scan = nameHit(await D.DWRDoc.scanOffice(ab, engine));
+      const scan = await D.DWRDoc.scanOffice(ab, engine);
+      if (ocrState.enabled) {
+        const ocr = await ocrScanFile(full, buf);
+        if (ocr.hits) {
+          scan.hits += ocr.hits;
+          scan.hitChars = (scan.hitChars || 0) + ocr.hitChars;
+          scan.totalChars = (scan.totalChars || 0) + ocr.totalChars;
+          (ocr.matched || []).forEach((w) => { if (scan.matched.indexOf(w) < 0) scan.matched.push(w); });
+          scan.parts = (scan.parts || []).concat(ocr.parts || []);
+        }
+      }
+      const named = nameHit(scan);
+      named.ratio = named.totalChars > 0 ? (named.hitChars || 0) / named.totalChars : 0;
       return { hits: scan.hits, hitChars: scan.hitChars || 0, totalChars: scan.totalChars || 0, ratio: scan.ratio || 0, matched: scan.matched, parts: scan.parts || [], firstHit: scan.firstHit, lastHit: scan.lastHit, touched: scan.hits > 0, outAb: null, outBuf: null };
     }
 
     // 旧版 OLE2（doc/xls/ppt）：只读检测，能查敏感词但不能原地清除
     // 只读检测档（旧版 OLE2 与 RTF）：能查敏感词但不能原地清除
     if (D.DWRDoc.isDetectableOnly(full)) {
-      const scan = nameHit(await D.DWRDoc.scanBytes(full, buf, engine));
+      const scan = await D.DWRDoc.scanBytes(full, buf, engine);
+      // 扫描件 PDF：正文层没有文字，全靠 OCR。开了 --ocr 就真去认，别只说一句「需人工复核」。
+      if (ocrState.enabled) {
+        const ocr = await ocrScanFile(full, buf);
+        if (ocr.hits) {
+          scan.hits += ocr.hits;
+          scan.matched = (scan.matched || []).slice();
+          (ocr.matched || []).forEach((w) => { if (scan.matched.indexOf(w) < 0) scan.matched.push(w); });
+          scan.parts = (scan.parts || []).concat(ocr.parts || []);
+        }
+      }
+      const named = nameHit(scan);
       return { hits: scan.hits, hitChars: 0, totalChars: 0, ratio: 0, matched: scan.matched, parts: scan.parts || [], firstHit: false, lastHit: false, touched: scan.hits > 0, outAb: null, outBuf: null, detectOnly: true, imageOnly: !!scan.imageOnly, unreadReason: scan.unreadReason };
     }
 
@@ -1403,7 +1630,10 @@ async function main() {
           // v4.67 格式跳过要计数：图片 / .pdf 被静默略过时，用户会误以为扫过但没命中。
           // v4.79 旧版 .doc/.xls/.ppt 进入只读检测（能查不能改），不再算作跳过。
           if (!(o.docsOnly ? isDocFile(e.name)
-            : (D.DWRDoc.isSupported(e.name) || D.DWRDoc.isDetectableOnly(e.name)))) {
+            : (D.DWRDoc.isSupported(e.name) || D.DWRDoc.isDetectableOnly(e.name)
+              // v4.93 开了 --ocr 之后，独立图片文件也进入检查范围：
+              // 图上的密级标识正文层里没有，按文本口径它是「干净文件」，检查软件却会报出来。
+              || (ocrState.enabled && D.DWRDoc.isImageFile(e.name))))) {
             extSkipped++; nameOnlyHit(full, '格式不支持'); continue;
           }
           // Office 所有者锁文件：~$ 开头，Word/Excel 打开文档时生成，非有效 ZIP
@@ -1445,6 +1675,11 @@ async function main() {
   if (detectOnlyCount) console.log('仅检测文件 : ' + detectOnlyCount + ' 个（.doc/.xls/.ppt/.rtf/.pdf/.zip 只读检测，不能清除；需转存为 docx / xlsx / pptx 后处理）');
   if (nameOnlyCount) console.log('仅文件名命中: ' + nameOnlyCount + ' 个（正文未读取，但文件名含敏感词，检查软件照样会报出；需重命名或人工复核）');
   if (imageOnlyCount) console.log('扫描件 PDF  : ' + imageOnlyCount + ' 个（无可读文本层，无法按文本检索，需人工复核或另存为文本格式）');
+  if (ocrSuspectFiles.length) {
+    console.log('OCR 不可靠  : ' + ocrSuspectFiles.length + ' 个文件（识别结果不可信，「命中 0」不代表干净，需人工看图）');
+    ocrSuspectFiles.slice(0, 10).forEach((p) => console.log('    ' + p));
+    if (ocrSuspectFiles.length > 10) console.log('    ……其余 ' + (ocrSuspectFiles.length - 10) + ' 个');
+  }
   if (imageOnlyFiles.length) {
     imageOnlyFiles.slice(0, 10).forEach((p) => console.log('    ' + p));
     if (imageOnlyCount > 10) console.log('    ……其余 ' + (imageOnlyCount - 10) + ' 个' + (o.html ? '见 HTML 清单' : '（可加 --html 生成可点击清单）'));
@@ -1500,4 +1735,8 @@ async function main() {
   verifySummary();
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+// v4.93：扫描收尾后关掉 OCR worker。tesseract 的 worker 是常驻子进程，
+// 不 terminate 的话进程扫描早就结束了却不退出——整盘批处理会永远卡在最后一步。
+main()
+  .catch((e) => { console.error(e); process.exitCode = 1; })
+  .then(() => shutdownOcrWorker());

@@ -79,6 +79,72 @@ function dingpuReport() {
   check('parseHtml-第二分节文件正常收录', r.files.length === 2 && /b\.docx$/.test(r.files[1].file));
 }
 
+/* ---------- 2b) v4.84 词级交叉校验：每词次数 / 未知 / 密级判定标记 ----------
+   鼎普这类报告的「命中关键字」列带每词出现次数（"内部(2)|秘密(1)"）。
+   v4.84 之前这个次数被整个丢掉：hits 存的是词种类数，却按「处数」显示，
+   复检时又拿它跟本工具的命中处数比——量纲不同，永远对不上。
+   这一组把「词种类数」与「处数」彻底分开，并锁住三种边界写法。 */
+{
+  const r = R.parseHtml(dingpuReport());
+  const a = r.files.find((f) => /a\.txt$/.test(f.file));
+  const b = r.files.find((f) => /b\.docx$/.test(f.file));
+  // a.txt 跨两节：秘密(1) + 内部(2) + 机密(3) → 词种类 3，处数 6
+  check('v484-每词次数被完整保留',
+    JSON.stringify(a.counts) === JSON.stringify({ 秘密: 1, 内部: 2, 机密: 3 }),
+    JSON.stringify(a.counts));
+  check('v484-处数=每词次数之和（与词种类数分开）',
+    a.hits === 3 && a.occurrences === 6, 'hits=' + a.hits + ' occ=' + a.occurrences);
+  check('v484-单节文件的次数同样解析',
+    JSON.stringify(b.counts) === JSON.stringify({ 内部: 1 }) && b.occurrences === 1,
+    JSON.stringify(b.counts) + ' occ=' + b.occurrences);
+
+  // 「未知」：检查软件自己都没认出是哪个词 —— 不能当误报藏掉
+  const html = '<table>'
+    + rowHtml(['文件名称', '文件路径', '文件大小', '命中关键字'])
+    + rowHtml(['x.txt', 'D:\\文档\\x.txt', '100', '未知'])
+    + '</table>';
+  const ru = R.parseHtml(html);
+  check('v484-命中关键字写「未知」时标记 unknown',
+    ru.files.length === 1 && ru.files[0].unknown === true && ru.files[0].hits === 0,
+    JSON.stringify(ru.files[0]));
+
+  // 「[绝密级]」是密级判定标记，不是文中出现了「绝密级」三个字
+  const html2 = '<table>'
+    + rowHtml(['文件名称', '文件路径', '文件大小', '命中关键字'])
+    + rowHtml(['y.txt', 'D:\\文档\\y.txt', '100', '[绝密级]'])
+    + '</table>';
+  const rl = R.parseHtml(html2);
+  check('v484-密级判定标记归一成「绝密」命中',
+    rl.files.length === 1 && rl.files[0].matched.join(',') === '绝密'
+      && rl.files[0].level === '绝密级',
+    JSON.stringify(rl.files[0]));
+
+  // 单元格解析器直接单测
+  const cell = R.parseKeywordCell('内部(2)|秘密(1)');
+  check('v484-parseKeywordCell 拆出词与次数',
+    cell.words.length === 2 && cell.words[0].word === '内部' && cell.words[0].count === 2
+      && cell.words[1].count === 1 && cell.unknown === false,
+    JSON.stringify(cell));
+  const cell2 = R.parseKeywordCell('未知');
+  check('v484-parseKeywordCell 识别「未知」', cell2.unknown === true && cell2.words.length === 0,
+    JSON.stringify(cell2));
+  // 没有次数后缀时，解析层如实记 null（报告没给次数），
+  // 归并进次数表时按 1 次兜底 —— 最终 occurrences 仍是 1
+  const cell3 = R.parseKeywordCell('机密');
+  check('v484-无次数后缀时解析层记 null',
+    cell3.words.length === 1 && cell3.words[0].word === '机密' && cell3.words[0].count === null,
+    JSON.stringify(cell3));
+  const html3 = '<table>'
+    + rowHtml(['文件名称', '文件路径', '文件大小', '命中关键字'])
+    + rowHtml(['z.txt', 'D:\\文档\\z.txt', '100', '机密'])
+    + '</table>';
+  const rz = R.parseHtml(html3);
+  check('v484-无次数后缀时归并按 1 次计',
+    rz.files.length === 1 && rz.files[0].occurrences === 1
+      && rz.files[0].counts.机密 === 1,
+    JSON.stringify(rz.files[0]));
+}
+
 // 配置行 / 表头行都不是数据；文件名含「路径」二字的数据行不能被误判为表头
 {
   const html = '<table>'
@@ -177,7 +243,11 @@ function dingpuReport() {
     }
     return RJ.slice(s, e);
   };
+  // v4.84：parseKeywords 现在会跳过「密级判定标记」（[绝密级] 这类），
+  // 它依赖 isLevelMark —— 抽取清单里必须一并带上，否则单独 eval 时报
+  // "isLevelMark is not defined"，整段单元格测试全灭。
   const fns = ['function isPathLike(s)', 'function normCell(c)',
+    'function isLevelMark(w)',
     'function parseKeywords(cell)', 'function isKeywordCell(c)', 'function toSize(v)'];
   const bodies = fns.map(grabFn);
   check('v451-五个单元格函数都在 report.js 中', bodies.every(Boolean),

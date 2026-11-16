@@ -295,6 +295,25 @@ body {
   padding-right: 4px;
 
 }
+/* v4.87：文件类别多选（对应外部保密检查系统的「检查文件类型」多选） */
+.cat-picker {
+  gap: 6px 10px;
+  max-height: none;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft, transparent);
+}
+.cat-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.cat-opt input { margin: 0; }
 .grp-head {
   display: flex;
   align-items: center;
@@ -948,6 +967,25 @@ td.path {
   color: var(--faint);
 
 }
+/* 处数不一致：与检查软件在同一批词上数到的处数对不上，需要人工看一眼 */
+.tag.diff {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn);
+}
+/* v4.89：命中占比档位（对齐外部保密检查系统的四档口径：极高 / 高 / 中 / 低） */
+.tag.tier-extreme {
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+.tag.tier-high {
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn);
+}
+.tag.tier-mid,
+.tag.tier-low {
+  background: var(--tag-bg);
+  color: var(--faint);
+}
 .status {
   font-size: 11.5px;
   padding: 2px 8px;
@@ -1216,6 +1254,10 @@ mark {
   font-size: 13px;
   color: var(--muted);
 }
+/* .scan-live 自带 display:flex，会盖掉 [hidden] 的浏览器默认 display:none——
+   结果是扫描一结束（或导入报告结束），横幅还杵在结果表上方显示着过期的
+   「正在扫描…」和「停止」按钮。跟 .progress-wrap[hidden] 一样补一条显式规则。 */
+.scan-live[hidden] { display: none; }
 .scan-live .live-dot {
   width: 8px;
   height: 8px;
@@ -1242,6 +1284,8 @@ mark {
 .scan-tally .t-hit { color: var(--danger-text); }
 .scan-tally .t-fp { color: var(--muted); }
 .scan-tally .t-un { color: var(--brand-1); }
+/* 漏检：检查软件报了、但本工具没命中——处理完仍会被报出，最需要先看 */
+.scan-tally .t-gap { color: var(--danger-text); font-weight: 600; }
 /* 合计行的三个数字可点：点了只看对应类别，再点一次回到全部（与上方状态下拉联动） */
 .scan-tally b {
   cursor: pointer;
@@ -2224,6 +2268,32 @@ tbody tr.selected {
 tbody tr.fp td {
   opacity: 0.5;
 
+}
+/* v4.94：本次跳过的行——复核人判定这一轮不动，行仍在结果与报告里，弱化显示 */
+tbody tr.skipped td {
+  opacity: 0.55;
+}
+tbody tr.skipped td.path {
+  text-decoration: line-through;
+  text-decoration-color: var(--hair2);
+}
+button.row-skip {
+  font-size: 12px;
+  padding: 2px 8px;
+  border: 1px solid var(--hair2);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink2);
+  cursor: pointer;
+}
+button.row-skip:hover {
+  border-color: var(--brand-1);
+  color: var(--brand-1);
+}
+button.row-skip.on {
+  border-color: var(--warn, #c8811f);
+  color: var(--warn, #c8811f);
+  background: var(--warn-soft, rgba(200, 129, 31, 0.12));
 }
 td.path {
   font-feature-settings: "tnum";

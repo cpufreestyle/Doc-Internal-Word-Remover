@@ -55,6 +55,8 @@ diag-out.txt
 *.mp4
 .playwright-cli/
 .qoder-credits/
+git 调试残留（git status / git diff 的临时落盘文件）
+.git*.tmp
 _cmsg*.txt
 _t*.log
 _sum*.txt
@@ -85,3 +87,7 @@ tools/zdiag.py
 
 # 编辑器 / 启动器交换文件（形如 启动工具.exe~，运行中被锁）
 *~
+
+# OCR 语言模型的原始下载件：随包分发的压缩版在 assets/ocr/lang/，
+# 根目录这份只是下载残留，内容与压缩包内一致，不入库
+/*.traineddata

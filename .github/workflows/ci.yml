@@ -21,14 +21,8 @@ jobs:
         run: cd tools/launcher && go test ./...
       - name: Run regression tests
         run: |
-          node test-allparts.mjs
-          node test-roundtrip.mjs
-          node test-coverage.mjs
-          node test-concurrency.mjs
-          node test-report.mjs
-          node test-formats.mjs
-          node test-rules.mjs
-          node test-security.mjs
-          node test-app.mjs
-          node test-release-sync.mjs
-          node tools/check-public.mjs
+          # 跑 package.json 里定义的完整套件，而不是在这里另抄一份清单：
+          # 抄写的那份早已落后（新增的 test-ocr / test-ocr-cli / test-hidden /
+          # test-revision-ocr / test-docx / test-reportxml / test-v494 等
+          # 都没进去），漏跑的套件等于没有门禁。npm test 是唯一事实源。
+          npm test

@@ -83,6 +83,8 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     scanSort: 'default',
     // 导入检查报告后：是否在表格中隐藏「复检误报」行（复检 0 命中）
     scanHideFp: false,
+    // v4.87：按类别多选的文件类型（对应外部保密检查系统的「检查文件类型」多选）
+    scanCats: [],
     // 报告导入 / 重新甄别进行中（用于禁用重复导入、接住「停止」按钮）
     importing: false,
     importCancel: false,
@@ -289,6 +291,12 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         // v4.10 文件名关键字
         if (typeof o.nameWords === 'string' && $('scanNameWords')) $('scanNameWords').value = o.nameWords;
         if (o.nameMode && $('scanNameMode')) $('scanNameMode').value = o.nameMode;
+        // v4.87：类别多选 / 文件名与内容关系 / 本机定密级
+        if (Array.isArray(o.cats)) applyCatSelection(o.cats);
+        if (o.nameRel && $('scanNameRel')) $('scanNameRel').value = o.nameRel;
+        if (typeof o.machineLevel === 'string' && $('scanMachineLevel')) $('scanMachineLevel').value = o.machineLevel;
+        // v4.88：图片 OCR 开关
+        if (typeof o.ocr === 'boolean' && $('scanOcr')) $('scanOcr').checked = o.ocr;
       }
       if (needsUpgrade && Array.isArray(s.rules)) {
         saveSettings();
@@ -323,7 +331,13 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
           extPreset: $('scanExtPreset') ? $('scanExtPreset').value : 'common',
           extCustom: $('scanExtCustom') ? $('scanExtCustom').value : '',
           nameWords: $('scanNameWords') ? $('scanNameWords').value : '',
-          nameMode: ($('scanNameMode') && $('scanNameMode').value === 'and') ? 'and' : 'or'
+          nameMode: ($('scanNameMode') && $('scanNameMode').value === 'and') ? 'and' : 'or',
+          // v4.87
+          cats: selectedCats(),
+          nameRel: ($('scanNameRel') && $('scanNameRel').value === 'and') ? 'and' : 'or',
+          machineLevel: $('scanMachineLevel') ? $('scanMachineLevel').value : '',
+          // v4.88
+          ocr: $('scanOcr') ? $('scanOcr').checked : false
         }
       }));
     } catch (e) { /* ignore */ }
@@ -749,6 +763,18 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     renderTable();
     updateSummary();
     if (it) log('已移除：' + it.path, 'info');
+  }
+
+  /**
+   * 命中部位名：「图片OCR（部件名）」。
+   * 部件名本身可能已经带括号（独立图片文件叫「（图片文件）」），直接拼会变成
+   * 「图片OCR（（图片文件））」这种双层括号——不影响命中，但读着别扭。
+   */
+  function ocrPartLabel(part) {
+    var p = String(part || '图片').trim();
+    if (!p) p = '图片';
+    if (/^[（(].*[）)]$/.test(p)) return p;
+    return '（' + p + '）';
   }
 
   /**
@@ -1224,12 +1250,86 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     '$Recycle.Bin', 'System Volume Information', 'AppData', 'node_modules', '.git'];
 
   /** 扫描单个文件：命中则记入 state.scanResults（并发调用安全） */
+  /**
+   * OCR 用的是「全文」口径的引擎：清理范围（首行 / 尾行）只约束改写，
+   * 检测阶段一律全文检索——图上的字不分行，清不清理是另一回事。
+   */
+  function buildOcrEngine() {
+    var cfg = buildConfig();
+    cfg.scope = 'all';
+    return Rules.createEngine(cfg);
+  }
+
+  /**
+   * 图片文字检查：把文件里的图取出来做 OCR，识别出的文字按同一套词库算命中。
+   * 命中部位写成「图片OCR（部件名）」，与正文命中分开记账，方便回溯到具体哪张图。
+   * @returns {Promise<{hits:number, hitChars:number, totalChars:number, matched:string[], parts:Array}>}
+   */
+  async function ocrScanFile(path, buf, opts, stats) {
+    var res = { hits: 0, hitChars: 0, totalChars: 0, matched: [], parts: [], suspects: [] };
+    var Ocr = window.DWROcr;
+    if (!Ocr || !opts.ocrEngine) return res;
+    var bytes = new Uint8Array(buf);
+    var ext = (String(path || '').split('.').pop() || '').toLowerCase();
+    var images = [];
+    try {
+      if (/^(png|jpe?g|bmp|gif|tiff?|webp)$/.test(ext)) {
+        var mime = 'image/' + (ext === 'jpg' ? 'jpeg' : ext);
+        images = [{ part: '（图片文件）', bytes: bytes, mime: mime }];
+      } else if (window.DWRPdf && window.DWRPdf.extractImages && Doc.isPdfBytes && Doc.isPdfBytes(bytes)) {
+        images = window.DWRPdf.extractImages(bytes) || [];
+      } else if (Doc.extractImages) {
+        images = await Doc.extractImages(path, bytes);
+      }
+    } catch (e) {
+      images = [];
+    }
+    if (!images.length) return res;
+    stats.ocrFiles = (stats.ocrFiles || 0) + 1;
+    for (var i = 0; i < images.length; i++) {
+      if (state.scanCancel) break;
+      var img = images[i];
+      var r = await Ocr.recognize(img);
+      if (!r || !r.text) {
+        if (r && r.error) log('OCR 失败：' + (img.part || '图片') + '（' + r.error + '）', 'warn');
+        continue;
+      }
+      stats.ocrImages = (stats.ocrImages || 0) + 1;
+      // v4.95：识别文本能不能用，要单独判一次。中文被认成拉丁字母（「机密」→「ULE」）
+      // 时引擎会报 0 命中——但那不等于图上干净，只是没认出来。这种文件不能静默放过。
+      var suspect = null;
+      try {
+        if (window.DWROcrSuspect) suspect = window.DWROcrSuspect.check(r.text);
+      } catch (e) { suspect = null; }
+      if (suspect && !suspect.ok) {
+        res.suspects = res.suspects.concat(suspect.reasons);
+        stats.ocrSuspect = (stats.ocrSuspect || 0) + 1;
+      }
+      var sc = opts.ocrEngine.scan(r.text);
+      res.totalChars += r.text.replace(/\s/g, '').length;
+      if (!sc || !sc.hits) continue;
+      stats.ocrHits = (stats.ocrHits || 0) + sc.hits;
+      res.hits += sc.hits;
+      res.hitChars += sc.hitChars || 0;
+      (sc.matched || []).forEach(function (w) { if (res.matched.indexOf(w) < 0) res.matched.push(w); });
+      res.parts.push({
+        name: '图片OCR' + ocrPartLabel(img.part),
+        label: '图片OCR' + ocrPartLabel(img.part),
+        hits: sc.hits,
+        matched: (sc.matched || []).slice()
+      });
+    }
+    return res;
+  }
+
   async function scanOneFile(job, opts, stats) {
     var handle = job.handle, path = job.path;
     if (state.scanCancel) return;
     // 旧版 .doc/.xls/.ppt 只读检测：能查敏感词，但不能原地清除（会破坏 OLE2 结构）
     var detectOnly = Doc.isDetectOnly(path);
-    if (!detectOnly && !Doc.isSupported(path)) {
+    // v4.88：开了图片 OCR 后，独立图片也算可查对象——图里的密级标识正文层查不到
+    var imageTarget = !!(opts.ocr && Doc.isImageFile && Doc.isImageFile(path));
+    if (!detectOnly && !imageTarget && !Doc.isSupported(path)) {
       noteSkip(stats, path, 'unsupported');
       // 正文读不了不等于不会被报出：检查软件连 .pdf / 压缩包的文件名一起检索。
       // 名字里带密级词的这类文件必须照样列出来，否则「命中 0」是假结论。
@@ -1268,11 +1368,35 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         var r = Doc.processText(dec.text, opts.engine);
         hits = r.hits; matched = r.matched; hitChars = r.hitChars || 0; totalChars = r.totalChars || 0;
         if (hits > 0) parts = [{ name: '（全文）', label: '（全文）', hits: hits, matched: matched.slice() }];
+      } else if (imageTarget) {
+        // 独立图片：没有正文层，命中全部来自 OCR
       } else {
         var s = await Doc.scanOffice(buf, opts.engine);
         hits = s.hits; matched = s.matched; hitChars = s.hitChars || 0; totalChars = s.totalChars || 0;
         parts = s.parts || [];
       }
+      // v4.88：图片文字检查（OCR）。截图、扫描件里的密级标识正文层里根本没有，
+      // 按正文口径它是干净文件，检查软件照样会报出来——这里补上这一层。
+      if (opts.ocr && !state.scanCancel) {
+        var ocrRes = await ocrScanFile(path, buf, opts, stats);
+        if (ocrRes && ocrRes.hits) {
+          hits += ocrRes.hits;
+          hitChars += ocrRes.hitChars || 0;
+          totalChars += ocrRes.totalChars || 0;
+          (ocrRes.matched || []).forEach(function (w) { if (matched.indexOf(w) < 0) matched.push(w); });
+          parts = parts.concat(ocrRes.parts || []);
+        }
+        // v4.95：OCR 认得不可靠，又一个密级词都没命中——不能当成干净文件。
+        // 记进未检查清单，让复核人知道这里需要人工看图。
+        if (ocrRes && ocrRes.suspects && ocrRes.suspects.length && hits === 0) {
+          noteSkip(stats, path, 'ocr-suspect');
+          log('OCR 识别不可靠，未能据此判定该文件干净（需人工看图）：' +
+            String(path || '').replace(/^.*[\\/]/, '') + '——' +
+            ocrRes.suspects.map(function (s) { return s.detail; }).join('；'), 'warn');
+        }
+      }
+      // v4.87：先记住「只算正文」的命中数——文件名与内容是「与」关系时要拿它做判定
+      var contentHits = hits;
       // 文件名也按「检查软件口径」计入命中：名为「机密合同.docx」的文件正文再干净也会被报出。
       // 必须在正文判断之外无条件执行——只有文件名中招的文件正是最容易漏掉的一类。
       if (Doc.scanFileName) {
@@ -1291,6 +1415,15 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         stats.imageOnly++;
         if (hits === 0) noteSkip(stats, path, 'scanned');
       }
+      // v4.87：文件名与内容「与」关系——外部保密检查系统的“文件名内容关系＝与”。
+      // 只有文件名中招、正文干净的文件不算命中（与检查软件口径一致），
+      // 但也不能悄悄丢掉：记一笔「仅文件名命中」，留给人复核。
+      if (opts.nameRel === 'and' && contentHits === 0 && hits > 0) {
+        stats.nameOnlyNoContent = (stats.nameOnlyNoContent || 0) + 1;
+        noteSkip(stats, path, 'name-only');
+        log('文件名命中但正文未命中（按「与」关系不计命中）：' + String(path || '').replace(/^.*[\\/]/, ''), 'info');
+        return;
+      }
       if (hits > 0) {
         stats.hitFiles++;
         stats.totalHits += hits;
@@ -1298,7 +1431,13 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
           path: path, handle: handle, file: file, dir: job.dir, name: job.name,
           size: file.size, hits: hits, matched: matched.slice(), selected: true,
           hitChars: hitChars, totalChars: totalChars, ratio: totalChars > 0 ? hitChars / totalChars : 0,
-          detectOnly: detectOnly, parts: parts, imageOnly: imageOnly, unreadReason: unreadReason
+          detectOnly: detectOnly, parts: parts, imageOnly: imageOnly, unreadReason: unreadReason,
+          contentHits: contentHits,
+          // v4.87：文件类别 / 修改时间 / 判定密级 / 越级存储
+          cat: DWRUtil.fileCatOf(path),
+          mtime: file.lastModified || 0,
+          level: DWRUtil.levelOfMatched(matched),
+          over: DWRUtil.isOverLevel(DWRUtil.levelOfMatched(matched), opts.machineLevel)
         };
         if (detectOnly) stats.detectOnly++;
         state.scanResults.push(row);
@@ -1334,7 +1473,11 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       size: 0, hits: nm.hits, matched: (nm.matched || []).slice(), selected: false,
       hitChars: nm.hitChars || 0, totalChars: nm.totalChars || 0,
       ratio: nm.totalChars > 0 ? (nm.hitChars || 0) / nm.totalChars : 0,
-      detectOnly: true, nameOnly: true, unreadReason: why, parts: nm.parts || []
+      detectOnly: true, nameOnly: true, unreadReason: why, parts: nm.parts || [],
+      // v4.87：类别 / 判定密级 / 越级（正文没读，密级只能按文件名里的词判）
+      cat: DWRUtil.fileCatOf(path),
+      level: DWRUtil.levelOfMatched(nm.matched || []),
+      over: DWRUtil.isOverLevel(DWRUtil.levelOfMatched(nm.matched || []), opts.machineLevel)
     };
     state.scanResults.push(row);
     state.scanArchive.push(row);
@@ -1481,9 +1624,58 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       if (!list.length) list = Doc.COMMON_EXT.slice();
     } else if (mode === 'common') {
       list = Doc.COMMON_EXT.slice();
+    } else if (mode === 'cats') {
+      // v4.87：按类目多选（对齐外部保密检查系统的「检查文件类型」多选）
+      var cats = selectedCats();
+      if (cats.indexOf('other') >= 0) {
+        list = null;               // 勾了「其他」＝不限制，等同全部支持格式
+      } else {
+        list = DWRUtil.catExts(cats);
+        if (!list || !list.length) list = Doc.COMMON_EXT.slice();
+      }
     }
     if (Doc.setExtFilter) Doc.setExtFilter(list);
     return list;
+  }
+
+  /* ---------------- v4.87：文件类别多选 ----------------
+     外部保密检查系统按「doc / xls / ppt / pdf / txt / html / wps / et」多选文件类型，
+     我们此前只有「主流 / 全部 / 自定义」三档，粒度太粗：想只扫 PDF + 表格做不到。
+     这里给出按类目的多选，勾选结果直接展开成扩展名过滤集，与「主流 / 全部 / 自定义」同一条通路。 */
+
+  /** 当前勾选的文件类别 key 列表 */
+  function selectedCats() {
+    return (state.scanCats || []).slice();
+  }
+
+  /** 设置勾选状态（用于恢复设置） */
+  function applyCatSelection(keys) {
+    var valid = {};
+    DWRUtil.FILE_CATS.forEach(function (c) { valid[c.key] = true; });
+    state.scanCats = (keys || []).filter(function (k) { return valid[k]; });
+    syncCatPicker();
+  }
+
+  /** 把状态里的勾选同步到界面 */
+  function syncCatPicker() {
+    var box = $('scanCatBox');
+    if (!box || typeof box.querySelectorAll !== 'function') return;
+    Array.prototype.forEach.call(box.querySelectorAll('input[type=checkbox]'), function (cb) {
+      cb.checked = (state.scanCats || []).indexOf(cb.value) >= 0;
+    });
+  }
+
+  /** 生成类别多选控件（数据源在 util.js 的 FILE_CATS，界面与逻辑不写死扩展名） */
+  function renderCatPicker() {
+    var box = $('scanCatBox');
+    if (!box) return;
+    if (box.dataset) box.dataset.ready = '1';
+    box.innerHTML = DWRUtil.FILE_CATS.map(function (c) {
+      var on = (state.scanCats || []).indexOf(c.key) >= 0 ? ' checked' : '';
+      return '<label class="cat-opt" data-tip="' + escapeHtml(c.label) + '类文件（' + c.exts.slice(0, 6).join(' / ')
+        + (c.exts.length > 6 ? ' 等' : '') + '）"><input type="checkbox" value="' + c.key + '"' + on + '>'
+        + escapeHtml(c.label) + '</label>';
+    }).join('');
   }
 
   /** v4.10 文件名关键字：解析界面输入，与命令行 --name-words 同口径。
@@ -1503,6 +1695,47 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     return mode === 'and' ? words.every(has) : words.some(has);
   }
 
+  /**
+   * v4.87：给一行补上判定密级与「越级存储」标记。
+   * 文件密级取命中词里级别最高的那个（绝密 > 机密 > 秘密 > 内部）；
+   * 高于「本机定密级」即为越级——对应外部保密检查系统的自动判定项
+   * 「越级存储密标文件」。
+   */
+  function applyLevelMeta(r, machineLevel) {
+    if (!r) return r;
+    if (!r.cat) r.cat = DWRUtil.fileCatOf(r.path);
+    var lv = DWRUtil.levelOfMatched(r.matched || []);
+    // 复检前只有检查软件给的命中词（甚至只有它标出的密级），复检后以本工具命中词为准
+    if (!lv && r.checkerLevel && DWRUtil.SECRET_LEVELS.indexOf(r.checkerLevel) >= 0) lv = r.checkerLevel;
+    // v4.94：本工具没命中密级词，但检查软件在「标记密级」列里给了结论（绝密/机密/秘密/内部）
+    //   或在「涉密情况」列里写了「涉嫌越级存储」——那是对方已经得出的判断，
+    //   复检没命中不代表对方错了，留档以便对照（此处只作兜底，不覆盖本工具的结论）。
+    if (!lv && r.checkerMarkLevel && DWRUtil.SECRET_LEVELS.indexOf(r.checkerMarkLevel) >= 0) {
+      lv = r.checkerMarkLevel;
+    }
+    r.level = lv;
+    r.over = DWRUtil.isOverLevel(lv, machineLevel);
+    return r;
+  }
+
+  /** 当前界面上的「本机定密级」 */
+  function machineLevelVal() {
+    var el = $('scanMachineLevel');
+    return (el && el.value) ? el.value : '';
+  }
+
+  /**
+   * v4.89：这一行能不能判「公开」。
+   * 判公开的前提是真的读到了正文并且没命中密级标识：
+   * 导入报告没复检的行、读不动正文的行（扫描件 PDF / 旧格式）都还不能下结论。
+   */
+  function rowJudgedPublic(r) {
+    if (!r || r.level) return false;
+    if (r.fromReport && (!r.handle || !r.checked)) return false;
+    if (r.unreadReason || r.nameOnly) return false;
+    return true;
+  }
+
   function scanOpts() {
     applyExtFilter();
     return {
@@ -1511,7 +1744,13 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       maxDepth: Math.max(1, parseInt($('scanMaxDepth').value, 10) || 8),
       skipSys: $('scanSkipSys').checked,
       nameWords: parseNameWords($('scanNameWords') ? $('scanNameWords').value : ''),
-      nameMode: ($('scanNameMode') && $('scanNameMode').value === 'and') ? 'and' : 'or'
+      nameMode: ($('scanNameMode') && $('scanNameMode').value === 'and') ? 'and' : 'or',
+      // v4.87：文件名与内容的关系（与 / 或）、本机定密级（越级存储判定）
+      nameRel: ($('scanNameRel') && $('scanNameRel').value === 'and') ? 'and' : 'or',
+      machineLevel: ($('scanMachineLevel') ? $('scanMachineLevel').value : '') || '',
+      // v4.88：图片文字检查（OCR）。识别模型随包分发，全程本地，不联网。
+      ocr: !!(($('scanOcr') && $('scanOcr').checked)),
+      ocrEngine: ($('scanOcr') && $('scanOcr').checked) ? buildOcrEngine() : null
     };
   }
 
@@ -1547,9 +1786,13 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
     'too-big': '超过大小上限',
     unreadable: '读取失败',
     'name-filter': '文件名未匹配',
+    'name-only': '仅文件名命中（正文未命中）',
     limit: '达到文件数上限',
     'no-permission': '目录无权限',
-    scanned: '扫描件 PDF（无文本层）'
+    scanned: '扫描件 PDF（无文本层）',
+    // v4.95：OCR 认出来的东西不可信（中文被认成拉丁字母、或整段认不出字），
+    // 此时不能据此断言「图上没有密级标识」——记进未检查清单，交人工复核。
+    'ocr-suspect': 'OCR 识别不可靠（需人工复核）'
   };
   // 路径明细只留样本，计数永远准确：整盘扫描时未检查文件可能上百万，全存会撑爆内存
   var SKIP_SAMPLE_MAX = 500;
@@ -1618,6 +1861,16 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
       var s = scanRowState(r);
       if (s === 'hit') hit++; else if (s === 'fp') fp++; else un++;
     });
+    // 漏检：检查软件报了、但本工具没命中的词。清不掉，处理后仍会被报出来。
+    var gap = rows.filter(function (r) { return (r.checkerOnlyWords || []).length; }).length;
+    // v4.87：越级存储——文件密级高于本机定密级
+    var over = rows.filter(function (r) { return r.over; }).length;
+    // v4.89：标密 / 公开分档——对应外部保密检查系统的「标密文件 / 判定的公开文件」页签
+    var secret = 0, publicN = 0;
+    rows.forEach(function (r) {
+      if (r.level) { secret++; return; }
+      if (rowJudgedPublic(r)) publicN++;
+    });
     var cur = state.scanFilterStatus || 'all';
     var cls = function (st) { return st === cur ? ' on' : ''; };
     var skipN = skipTotal(state.lastScan);
@@ -1627,6 +1880,18 @@ function outmodeLabel(v) { return OUTMODE_LABEL[v] || v || ''; }
         + ' aria-pressed="' + (cur === 'fp') + '">' + fp + '</b>' : '') +
       (un ? ' · 未检查 <b class="t-un' + cls('unchecked') + '" data-st="unchecked"'
         + ' aria-pressed="' + (cur === 'unchecked') + '">' + un + '</b>' : '') +
+      (gap ? ' · 漏检 <b class="t-gap' + cls('gap') + '" data-st="gap"'
+        + ' aria-pressed="' + (cur === 'gap') + '" title="检查软件报了但本工具没命中的词：清不掉，处理后仍会被检查软件报出">'
+        + gap + '</b>' : '') +
+      (over ? ' · 越级 <b class="t-gap' + cls('over') + '" data-st="over"'
+        + ' aria-pressed="' + (cur === 'over') + '" title="文件判定的密级高于本机定密级（越级存储），需按密级管理要求处理">'
+        + over + '</b>' : '') +
+      (secret ? ' · 标密 <b class="t-hit' + cls('secret') + '" data-st="secret"'
+        + ' aria-pressed="' + (cur === 'secret') + '" title="判定出了密级的文件（绝密 / 机密 / 秘密 / 内部）">'
+        + secret + '</b>' : '') +
+      (publicN ? ' · 公开 <b class="t-un' + cls('public') + '" data-st="public"'
+        + ' aria-pressed="' + (cur === 'public') + '" title="已检查但全文没有密级标识的文件">'
+        + publicN + '</b>' : '') +
       (skipN ? ' · 未检查文件 <b class="t-un" data-skip="1" title="点此展开未检查清单">' + skipN + '</b>' : '') +
       ' · 共 ' + rows.length + ' 条';
     renderScanSkipped();
@@ -2047,6 +2312,19 @@ async function scanFolder() {
     $('scanFolderBtn').disabled = true;
     $('scanMeta').textContent = '正在扫描：' + (root.name || '所选文件夹') + ' …';
 
+    // v4.88：图片 OCR 需要先加载随包分发的识别模型（约 12MB，本地加载，不联网）
+    if (opts.ocr && window.DWROcr) {
+      try {
+        log('正在加载本地图片识别模型（约 12MB，只在本机运行）…', 'info');
+        await window.DWROcr.warmup();
+        log('图片识别模型已就绪。', 'ok');
+      } catch (e) {
+        log('图片 OCR 不可用：' + String((e && e.message) || e) + '（可关闭「图片文字检查」继续按正文扫描）', 'warn');
+        opts.ocr = false;
+        opts.ocrEngine = null;
+      }
+    }
+
     var rootLabel = root.name || '所选文件夹';
     log('开始扫描文件夹：' + rootLabel + '（上限 ' + opts.maxFiles + ' 个文件，最大深度 ' + opts.maxDepth + '）', 'info');
 
@@ -2077,9 +2355,21 @@ async function scanFolder() {
       (skipN ? ' · <b>' + skipN + '</b> 个未检查（' + skipBreakdown(stats) + '）' : '') +
       (stats.errors ? ' · ' + stats.errors + ' 个文件读取失败' : '');
 
-    // 扫描件 PDF 兜底提示：纯图片无文本层，本工具不做 OCR，必须转人工复核或另存为文本格式
+    // 扫描件 PDF 兜底提示：纯图片无文本层。开了 OCR 就走 OCR，没开只能人工复核
     if (stats.imageOnly) {
-      log('<span class="t-image">扫描件 PDF：<b>' + stats.imageOnly + '</b> 个文件无可读文本层，本工具不做 OCR，按文本检索不到任何内容，请人工复核或另存为文本格式后重新扫描。</span>', 'warn');
+      log('<span class="t-image">扫描件 PDF：<b>' + stats.imageOnly + '</b> 个文件无可读文本层，'
+        + (opts.ocr ? '已尝试用图片 OCR 识别，仍未识别出文字的请人工复核或另存为文本格式后重新扫描。' : '本工具默认不做 OCR，按文本检索不到任何内容，请人工复核或另存为文本格式后重新扫描。')
+        + '</span>', 'warn');
+    }
+    // v4.88：图片 OCR 统计
+    if (opts.ocr) {
+      log('图片文字检查（OCR）：' + (stats.ocrFiles || 0) + ' 个文件含图片，识别 ' + (stats.ocrImages || 0) + ' 张，'
+        + '命中 ' + (stats.ocrHits || 0) + ' 处。', (stats.ocrHits || 0) ? 'warn' : 'ok');
+      // v4.95：认不出来的不等于干净——单独说一句，别让人以为图都看过了。
+      if (stats.ocrSuspect) {
+        log('其中 <b>' + stats.ocrSuspect + '</b> 张图的识别结果不可靠（中文被认成拉丁字母、或没认出汉字），' +
+          '这些图上有没有密级标识需人工确认，已记入未检查清单。', 'warn');
+      }
     }
     log('文件夹扫描完成：命中 ' + stats.hitFiles + ' 个文档 / ' + stats.totalHits + ' 处敏感词'
       + (stats.detectOnly ? '，另有 ' + stats.detectOnly + ' 个只读格式仅检测' : '')
@@ -2162,11 +2452,17 @@ async function scanFolder() {
    */
   async function recheckReportRows(rows, opts) {
     opts = opts || {};
-    var engine = buildEngine();
-    var targets = [], bigSkip = 0;
+    // 固定全文口径：外部检查软件按全文检索，复检必须与它同口径（见 buildRecheckEngine）
+    var engine = buildRecheckEngine();
+    var targets = [], bigSkip = 0, noFile = 0;
     rows.forEach(function (r) {
         if (!r.handle || !(Doc.isSupported(r.path) || Doc.isDetectableOnly(r.path))) return;
       if (r.size > MAX_FILE_BYTES) bigSkip++;
+      // 导入时没读到内容（文件已被移动/改名/删除、或没有读取权限）：
+      // 这类行不是「复检失败」，而是「正文根本没看」。丢进复检只会对 null.file
+      // 调 arrayBuffer 而报错，日志刷屏且把真正的失败淹掉。这里直接跳过，
+      // 后面仍按文件名给结论、按检查软件原报告列出。
+      else if (!r.file) noFile++;
       else targets.push(r);
     });
     var recheckErr = 0, done = 0;
@@ -2189,6 +2485,7 @@ async function scanFolder() {
             var res = Doc.processText(dec.text, engine);
             r.hits = res.hits;
             r.matched = res.matched || [];
+            r.ourCounts = res.counts || {};
           } else if (Doc.isDetectableOnly(r.path)) {
             p = Doc.scanBytes(r.path, new Uint8Array(buf), engine, {
               shouldCancel: function () { return state.importCancel; }
@@ -2196,18 +2493,44 @@ async function scanFolder() {
               if (res && res.cancelled) { r.cancelled = true; return; }
               r.hits = res.hits;
               r.matched = res.matched || [];
+              r.ourCounts = res.counts || {};
               if (res.imageOnly) { r.imageOnly = true; r.unreadReason = res.unreadReason; }
             });
           } else {
             p = Doc.scanOffice(buf, engine).then(function (res) {
               r.hits = res.hits;
               r.matched = res.matched || [];
+              r.ourCounts = res.counts || {};
             });
           }
           return p;
         }).then(function () {
+          r.contentHits = r.hits;
+          // 文件名也按「检查软件口径」计入命中（与文件夹扫描同一套规则）：
+          // 外部保密检查软件按「文件名 + 正文」一起检索，名为「内部资料.pdf」、
+          // 「机密合同.docx」的文件正文再干净也会被报出来。复检只查正文时，
+          // 这类行会被算成「0 命中 = 误报」而自动隐藏——文件照原样发出去，
+          // 检查软件照样报，等于把没清干净的文件放过了。
+          if (Doc.scanFileName) {
+            var nm = null;
+            try { nm = Doc.scanFileName(r.path, engine); } catch (e0) { nm = null; }
+            if (nm && nm.hits) {
+              r.hits += nm.hits;
+              (nm.matched || []).forEach(function (w) {
+                if (r.matched.indexOf(w) < 0) r.matched.push(w);
+              });
+              if (!r.ourCounts) r.ourCounts = {};
+              Object.keys(nm.counts || {}).forEach(function (w) {
+                r.ourCounts[w] = (r.ourCounts[w] || 0) + nm.counts[w];
+              });
+              r.parts = (r.parts || []).concat(nm.parts || []);
+              r.nameHit = true;
+            }
+          }
           r.checked = true;
           r.selected = r.hits > 0;
+          applyLevelMeta(r, machineLevelVal());
+          crossCheckWords(r);
         }).catch(function (e) {
           r.checked = false;
           r.selected = true;
@@ -2226,6 +2549,10 @@ async function scanFolder() {
       log((state.importCancel ? '复检已中止（完成 ' + done + '/' + targets.length + '）：' : '复检完成：')
         + '确认命中 ' + realOk + ' 个、误报 ' + fp + ' 个（耗时 ' + ((Date.now() - t1) / 1000).toFixed(1) + ' 秒）。',
         state.importCancel ? 'warn' : 'ok');
+      if (noFile) {
+        log(noFile + ' 个文件导入时没读到内容（已被移动/改名/删除，或无读取权限），'
+          + '无法复检正文，按检查软件原报告列出，请人工确认。', 'warn');
+      }
     }
     // 正文没读的行（格式不支持 / 过大 / 未定位）也要按文件名给个结论：
     // 保密检查软件按「文件名 + 正文」一起检索，名字带密级词就会被开出来。
@@ -2242,11 +2569,14 @@ async function scanFolder() {
       if (!nm || !nm.hits) return;
       r.hits = nm.hits;
       r.matched = (nm.matched || []).slice();
+      r.ourCounts = nm.counts || {};
       r.parts = nm.parts || [];
       r.checked = true;
       r.nameOnly = true;
       r.detectOnly = true;
       r.selected = false;
+      applyLevelMeta(r, machineLevelVal());
+      crossCheckWords(r);
     });
     return {
       // 只认「本工具给出结论且命中」的行：未复检行保留的是检查软件的原始命中数，
@@ -2258,27 +2588,91 @@ async function scanFolder() {
       imageOnly: rows.filter(function (r) { return r.imageOnly; }).length,
       recheckErr: recheckErr,
       bigSkip: bigSkip,
+      noFile: noFile,
       checked: targets.length,
       done: done,
       cancelled: !!state.importCancel
     };
   }
 
+  /**
+   * 词级交叉校验：把「检查软件报的词」与「本工具复检命中的词」逐词比对。
+   *
+   *  - checkerOnlyWords：检查软件报了、但按当前词库复检没命中的词。
+   *    这些词清不掉——文件处理完仍会被检查软件报出来，属于漏检，必须人工处理或补词库。
+   *  - oursOnlyWords：本工具命中、但检查软件没报的词。
+   *    多半是检查软件词库里没有的词（如公文文号）。清掉它们不影响合规，属安全冗余。
+   *
+   *  复检固定走全文口径（buildRecheckEngine），与检查软件同口径，所以两边词集可以直接比。
+   *  只有「导入外部报告」的行才有对方词集；普通扫描没有 checkerMatched，不做交叉校验。
+   */
+  function crossCheckWords(r) {
+    r.checkerOnlyWords = [];
+    r.oursOnlyWords = [];
+    if (!r || !r.fromReport) return;
+    // 报告里「命中关键字」写的是「未知」：检查软件自己都没认出是哪个词，
+    // 它的词集是空的。此时我们命中的词既不能算「漏检」（它没报具体词），
+    // 也不能算「多报」（我们不知道它看见了什么）——这一行按人工复核处理。
+    if (r.checkerUnknown) return;
+    var ours = normWordList(r.matched);
+    var theirs = normWordList(r.checkerMatched);
+    r.checkerOnlyWords = theirs.filter(function (w) { return ours.indexOf(w) < 0; });
+    r.oursOnlyWords = ours.filter(function (w) { return theirs.indexOf(w) < 0; });
+  }
+
+  /** 词表规范化：去空白、去重，用于两边词集比对 */
+  function normWordList(list) {
+    var out = [];
+    (list || []).forEach(function (w) {
+      var s = String(w == null ? '' : w).trim();
+      if (s && out.indexOf(s) < 0) out.push(s);
+    });
+    return out;
+  }
+
+  /**
+   * 逐词处数比对：同一个词上，我们数到的处数与检查软件报的是否一致。
+   *
+   *  v4.85：此前界面上比的是「本工具总命中处数」与「检查软件总处数」，
+   *  而本工具词库更宽（多出通知 / 银行 / 公文文号等），两个总数根本不是同一个量——
+   *  几乎每份报告都会显示「数量不同」，等于没报。改成逐词比：
+   *  只比检查软件报过的那些词，同一个词上处数一致才算一致。
+   */
+  function countDiff(r) {
+    var out = [];
+    if (!r || !r.checked || !r.checkerCounts) return out;
+    var ours = r.ourCounts || {};
+    Object.keys(r.checkerCounts).forEach(function (w) {
+      var theirs = r.checkerCounts[w] || 0;
+      var mine = ours[w] || 0;
+      if (mine !== theirs) out.push({ word: w, ours: mine, theirs: theirs });
+    });
+    return out;
+  }
+
   /** 报告行重新甄别后，按当前结果重算扫描汇总（命中 / 误报 / 检查软件条数） */
   function refreshReportSummary() {
     if (!state.lastScan || !state.lastScan.fromReport) return null;
     var hitFiles = 0, totalHits = 0, falsePos = 0;
+    var checkerOnlyFiles = 0, oursOnlyFiles = 0, unknownFiles = 0;
     state.scanArchive.forEach(function (r) {
       // 与导入摘要同一口径：只有本工具复检过的行才计入命中 / 处数，
       // 未复检行（格式不支持 / 未定位）保留的检查软件命中数不计入
       if (r.checked && (r.hits || 0) > 0) hitFiles++;
       if (r.checked) totalHits += (r.hits || 0);
       if (isFalsePositiveRow(r)) falsePos++;
+      // 词级交叉校验：检查软件报了但我们没命中的词（清完仍会被报出）必须单独统计
+      if (r.checked && (r.checkerOnlyWords || []).length) checkerOnlyFiles++;
+      if (r.checked && (r.oursOnlyWords || []).length) oursOnlyFiles++;
+      if (r.checkerUnknown) unknownFiles++;
     });
     state.lastScan.hitFiles = hitFiles;
     state.lastScan.totalHits = totalHits;
     state.lastScan.falsePos = falsePos;
     state.lastScan.checkerHits = state.scanArchive.length;
+    state.lastScan.checkerOnlyFiles = checkerOnlyFiles;
+    state.lastScan.oursOnlyFiles = oursOnlyFiles;
+    state.lastScan.checkerUnknownFiles = unknownFiles;
     state.scanHideFp = falsePos > 0;
     return state.lastScan;
   }
@@ -2463,12 +2857,40 @@ async function scanFolder() {
         // 检查软件的原始结论留档：复检后 hits / matched 被本工具结果覆盖，便于对比与误报标注
         checkerHits: f.hits || 0,
         checkerMatched: f.matched || [],
+        // v4.84：检查软件报的「处数」与每词次数表。
+        // checkerHits 是词种类数（历史字段，语义不动），checkerOccurrences 才是处数——
+        // 两者混用会把「检查软件报了 2 个词」当成「检查软件报了 2 处」来比。
+        checkerOccurrences: f.occurrences || 0,
+        checkerCounts: f.counts || {},
+        checkerLevel: f.level || '',
+        checkerUnknown: !!f.unknown,
+        // 词级交叉校验结果（复检后写入）
+        checkerOnlyWords: [],
+        oursOnlyWords: [],
         // 复检 0 命中的行会被自动取消勾选，避免把检查软件的误报批量处理掉
         selected: false,
         fromReport: true,
         // 旧版 .doc/.xls/.ppt：可只读复检，但不能加入处理列表
-        detectOnly: Doc.isDetectableOnly(f.file)
+        detectOnly: Doc.isDetectableOnly(f.file),
+        // v4.87：类别 + 按检查软件报告给出的密级（复检后会按本工具命中词重算）
+        cat: DWRUtil.fileCatOf(f.file),
+        // v4.94：外部检查系统报告里的原报告字段，留档用于逐项对照。
+        //   此前导入时只取了路径 / 关键字 / 大小，报告里给的创建时间、修改时间、
+        //   文件类别、命中百分比、标记密级、涉密情况全部被丢掉——检查软件已经算好的
+        //   结论不该因为「我们也能算」就扔掉：两者不一致时，那正是最该看的信号。
+        //   字段统一加 checker 前缀，与本工具复检后写入的结果分开，避免口径混用。
+        checkerCtime: f.ctime || 0,
+        checkerMtime: f.mtime || 0,
+        checkerRatio: f.ratio || 0,
+        checkerMarkLevel: f.markLevel || '',
+        checkerVerdict: f.verdict || '',
+        checkerCat: f.cat || '',
+        // v4.94：导入的行此前没有 mtime，结果表「修改时间」列一律是空的。
+        //   报告里本来就给了修改时间与创建时间，直接沿用；拿不到时才等定位到文件后补。
+        mtime: f.mtime || 0,
+        ctime: f.ctime || 0
       };
+      applyLevelMeta(row, machineLevelVal());
       var dm = /^([A-Za-z]:)[\\/](.*)$/.exec(f.file);
       var driveKey = dm ? dm[1].toUpperCase() : null;
       // 中止：定位阶段对数百条报告可能耗时数分钟，点「停止扫描」必须在这里立刻停下
@@ -2537,6 +2959,10 @@ async function scanFolder() {
       hitFiles: realHits,
       checkerHits: rows.length,
       falsePos: falsePos,
+      // 词级交叉校验统计（refreshReportSummary 会按当前结果重算）
+      checkerOnlyFiles: rows.filter(function (r) { return (r.checkerOnlyWords || []).length; }).length,
+      oursOnlyFiles: rows.filter(function (r) { return (r.oursOnlyWords || []).length; }).length,
+      checkerUnknownFiles: rows.filter(function (r) { return r.checkerUnknown; }).length,
       totalHits: rc.totalHits,
       maxFiles: files.length,
       maxDepth: 0,
@@ -2549,7 +2975,9 @@ async function scanFolder() {
     scanTableChanged(true);
      $('scanResultCard').style.display = 'block';
      renderScanResults();
-     $('scanMeta').innerHTML = '已导入报告：<b>' + rows.length + '</b> 条，确认命中 <b>' + realHits + '</b> 个' + (falsePos ? '，误报 <b>' + falsePos + '</b> 个已隐藏' : '') + '。';
+     var gapN = rows.filter(function (r) { return (r.checkerOnlyWords || []).length; }).length;
+     $('scanMeta').innerHTML = '已导入报告：<b>' + rows.length + '</b> 条，确认命中 <b>' + realHits + '</b> 个' + (falsePos ? '，误报 <b>' + falsePos + '</b> 个已隐藏' : '') + '。'
+       + (gapN ? ' 漏检 <b>' + gapN + '</b> 个（检查软件报了、本工具没命中，清不掉）' : '');
     var located = rows.length - noRoot - missing - aborted;
     log('已导入 ' + rows.length + ' 条（检查软件报告命中 ' + files.length + ' 个）：已定位 ' + located + ' 个'
       + (rc.checked ? '，其中 ' + rc.checked + ' 个格式支持已按当前词库复检' : '')
@@ -2569,6 +2997,21 @@ async function scanFolder() {
     if (unsupported) log(unsupported + ' 个为 .pdf / 压缩包 / 镜像等本工具暂不支持的格式（无法复检、按检查软件原结论列出）：请先转换为可处理格式或人工复核。', 'info');
     if (falsePos) log('复检 0 命中的误报已默认隐藏并取消勾选（表格上方「隐藏误报」可切回），勾选的 ' + realHits
       + ' 个为按当前词库复检确认的命中。', 'info');
+    // v4.84：词级交叉校验的结论要当面说清楚——漏检的词清不掉，处理完还会被报出来
+    var gapRows = rows.filter(function (r) { return (r.checkerOnlyWords || []).length; });
+    if (gapRows.length) {
+      var gapSample = gapRows.slice(0, 3).map(function (r) {
+        return r.checkerOnlyWords.join('、') + '（' + r.path + '）';
+      }).join('；');
+      log('漏检警告：' + gapRows.length + ' 个文件里检查软件报了、但按当前词库没命中的词，这些词清不掉，'
+        + '处理后仍会被检查软件报出。示例：' + gapSample
+        + (gapRows.length > 3 ? '……（表格上方「漏检」可只看这些文件）' : ''), 'warn');
+    }
+    if (rows.some(function (r) { return r.checkerUnknown; })) {
+      log('有 ' + rows.filter(function (r) { return r.checkerUnknown; }).length
+        + ' 个文件的报告里「命中关键字」写的是「未知」——检查软件自己都没认出是哪个词，'
+        + '这类行不做自动隐藏，请人工复核。', 'warn');
+    }
     log('勾选后即可「一键处理选中 / 一键删除选中 / 将选中项加入处理列表」。报告文件本身含敏感路径，处理完成后建议删除。', 'info');
   }
   /** 加入处理列表：只把行移出扫描结果表格；报告数据源仍保留本次全部命中（v2.8 的取舍） */
@@ -2576,7 +3019,8 @@ async function scanFolder() {
     if (!rows.length) return 0;
     // 定位阶段只对格式支持的文件读内容，未复检 / 不支持的行的 file 为 null；
     // 这些行进处理列表也只会被跳过，直接加会在这行抛「Cannot read properties of null」
-    var usable = rows.filter(function (r) { return r.file && !r.detectOnly; });
+    // v4.94：跳过的文件不进处理列表（行末「加入」按钮也会被禁用，这里是兜底）。
+    var usable = rows.filter(function (r) { return r.file && !r.detectOnly && !r.skipped; });
     if (!usable.length) {
       var onlyDetect = rows.length && rows.every(function (r) { return r.detectOnly; });
       log('选中的 ' + rows.length + ' 行没有可加入处理列表的文件'
@@ -2643,8 +3087,18 @@ async function scanFolder() {
     return 'hit';
   }
 
-  var SCAN_STATUS_LABEL = { all: '全部', hit: '仅看命中', fp: '仅看误报', unchecked: '未检查' };
-  var SCAN_SORT_LABEL = { default: '默认顺序', hits: '命中多→少', size: '大小↓', path: '路径 A→Z' };
+  // v4.89：secret / public 两档对应外部保密检查系统结果表底部的
+  //   「标密文件 / 判定的密级文件 / 判定的公开文件」页签。
+  var SCAN_STATUS_LABEL = {
+    all: '全部', hit: '仅看命中', fp: '仅看误报', unchecked: '未检查',
+    gap: '仅看漏检', over: '仅看越级', secret: '仅看标密', public: '仅看公开',
+    skipped: '仅看本次跳过'
+  };
+  // v4.89：新增按命中占比、按涉密程度排序——复核时先看「最像涉密文件」的那批
+  var SCAN_SORT_LABEL = {
+    default: '默认顺序', hits: '命中多→少', size: '大小↓', path: '路径 A→Z',
+    ratio: '命中占比 高→低', level: '涉密程度 高→低'
+  };
 
   /** 复位扫描表过滤条件（新一轮扫描 / 新导入报告时调用，避免上一轮的关键字把新结果全滤掉） */
   function resetScanFilters() {
@@ -2674,7 +3128,25 @@ async function scanFolder() {
     var q = (state.scanFilterQ || '').trim().toLowerCase();
     var status = state.scanFilterStatus || 'all';
     var out = rows.filter(function (r) {
-      if (status !== 'all' && scanRowState(r) !== status) return false;
+      // v4.84：「漏检」与命中 / 误报不是互斥状态（一行可以既命中又有清不掉的词），
+      // 所以单独判，不走 scanRowState
+      if (status === 'gap') {
+        if (!(r.checkerOnlyWords || []).length) return false;
+      } else if (status === 'over') {
+        // v4.87：越级存储——文件判定密级高于本机定密级
+        if (!r.over) return false;
+      } else if (status === 'secret') {
+        // v4.89：标密文件——判定出了密级（绝密 / 机密 / 秘密 / 内部）
+        if (!r.level) return false;
+      } else if (status === 'public') {
+        // v4.89：判定的公开文件——已检查、但整篇没有任何密级标识命中。
+        // 未复检的行不给结论——检查软件报了不代表我们判过公开。
+        if (!rowJudgedPublic(r)) return false;
+      } else if (status === 'skipped') {
+        // v4.94：本次跳过的文件——复核人判定这一轮不动。
+        // 单独一档是为了能一眼看完「跳过了哪些」，需要改主意时直接批量恢复。
+        if (!r.skipped) return false;
+      } else if (status !== 'all' && scanRowState(r) !== status) return false;
       if (!q) return true;
       var hay = String(r.path || '').toLowerCase() + ' ' + (r.matched || []).join(' ').toLowerCase();
       return hay.indexOf(q) >= 0;
@@ -2687,6 +3159,15 @@ async function scanFolder() {
     } else if (sort === 'path') {
       out = out.slice().sort(function (a, b) {
         return String(a.path || '').localeCompare(String(b.path || ''));
+      });
+    } else if (sort === 'ratio') {
+      // v4.89：按命中占比从高到低——占比越高说明整篇越像涉密文件，复核先看这批
+      out = out.slice().sort(function (a, b) { return (b.ratio || 0) - (a.ratio || 0); });
+    } else if (sort === 'level') {
+      // v4.89：按涉密程度排序：先比密级（绝密 > 机密 > 秘密 > 内部），同级再比占比
+      out = out.slice().sort(function (a, b) {
+        var d = DWRUtil.levelRank(b.level || '') - DWRUtil.levelRank(a.level || '');
+        return d !== 0 ? d : (b.ratio || 0) - (a.ratio || 0);
       });
     }
     var cnt = $('scanFilterCount');
@@ -2739,7 +3220,8 @@ async function scanFolder() {
 
   /** 统一的表格空态：插图 + 标题 + 说明，替代原来的一行灰字 */
   function tdEmpty(title, sub, art, colspan) {
-    return '<td class="td-empty" colspan="' + (colspan || 7) + '"><div class="tn">' +
+    // v4.87：结果表新增「密级」列，列数由 7 变 8（空态要跨满整行）
+    return '<td class="td-empty" colspan="' + (colspan || 8) + '"><div class="tn">' +
       (EMPTY_ART[art] || EMPTY_ART.allClear) +
       '<span class="tn-title">' + escapeHtml(title) + '</span>' +
       '<span class="tn-sub">' + escapeHtml(sub) + '</span>' +
@@ -2781,10 +3263,14 @@ async function scanFolder() {
       cb.type = 'checkbox';
       cb.className = 'row-check';
       cb.checked = !!r.selected && !r.detectOnly;
-      cb.disabled = !!r.detectOnly;
-      cb.setAttribute('data-tip', r.detectOnly
-        ? '旧版 Office 仅做只读检测，需另存为 .docx 后才能处理'
-        : '选择此结果（Shift 连选）');
+      // v4.94：已跳过的行不能勾选——批量动作一律跳过它，
+      //   还让它显示为「已勾选」会让人以为这轮会被处理。
+      cb.disabled = !!r.detectOnly || !!r.skipped;
+      cb.setAttribute('data-tip', r.skipped
+        ? '本次跳过：这一轮不处理、不删除。先点行末「恢复」才能重新参与'
+        : (r.detectOnly
+          ? '旧版 Office 仅做只读检测，需另存为 .docx 后才能处理'
+          : '选择此结果（Shift 连选）'));
       cb.addEventListener('click', function (e) {
         if (e && e.stopPropagation) e.stopPropagation();
         var wantChecked = cb.checked;
@@ -2805,16 +3291,51 @@ async function scanFolder() {
       tr.appendChild(td);
       if (idx === state.scanPreviewIdx) tr.className = 'selected';
       if (isFalsePositiveRow(r)) tr.className = (tr.className ? tr.className + ' ' : '') + 'fp';
+      // v4.94：本次跳过的行弱化显示，但仍在表里——它没有被移出，只是这轮不动。
+      if (r.skipped) tr.className = (tr.className ? tr.className + ' ' : '') + 'skipped';
       var checkerNote = '';
+      // v4.84：检查软件报的是「处数」（每词次数之和），不是词种类数。
+      // 用词种类数去比本工具的命中处数，量纲不同，永远对不上。
+      var cOcc = r.checkerOccurrences || r.checkerHits || 0;
       if (r.checkerHits > 0) {
         if (isFalsePositiveRow(r)) {
-          checkerNote = ' <span class="tag bad" data-tip="保密检查软件报告命中 ' + r.checkerHits
+          checkerNote = ' <span class="tag bad" data-tip="保密检查软件报告命中 ' + cOcc
             + ' 处（' + escapeHtml((r.checkerMatched || []).join('、')) + '），按当前词库复检 0 命中，判为误报">误报</span>';
-        } else if (r.checked && r.hits !== r.checkerHits) {
-          checkerNote = ' <span class="tag" data-tip="本工具复检 ' + r.hits + ' 处 / 保密检查软件报告 ' + r.checkerHits
-            + ' 处（检查软件口径更宽，含本工具词库之外的词）">检查软件 ' + r.checkerHits + ' 处</span>';
         } else if (!r.checked) {
-      checkerNote = ' <span class="tag" data-tip="未定位或格式不支持（.rar / .7z / 镜像等），无法按当前词库复检；此处为保密检查软件报告的原始命中数">未复检 ' + r.checkerHits + ' 处</span>';
+          checkerNote = ' <span class="tag" data-tip="未定位或格式不支持（.rar / .7z / 镜像等），无法按当前词库复检；此处为保密检查软件报告的原始命中数">未复检 ' + cOcc + ' 处</span>';
+        } else {
+          // v4.85：逐词比处数。只比检查软件报过的那几个词——
+          // 本工具词库更宽，两个总数永远不等，拿总数比等于没比。
+          var diff = countDiff(r);
+          var tip = '保密检查软件报告命中 ' + cOcc + ' 处（' + (r.checkerMatched || []).join('、') + '）。';
+          if (diff.length) {
+            tip += '逐词比对：' + diff.map(function (d) {
+              return d.word + ' 本工具 ' + d.ours + ' 处 / 对方 ' + d.theirs + ' 处';
+            }).join('；') + '——同一批词上处数不一致，建议人工复核。';
+            checkerNote = ' <span class="tag diff" data-tip="' + escapeHtml(tip) + '">检查软件 ' + cOcc + ' 处 · 处数不一致</span>';
+          } else {
+            tip += '逐词比对：同一批词上处数完全一致。';
+            checkerNote = ' <span class="tag" data-tip="' + escapeHtml(tip) + '">检查软件 ' + cOcc + ' 处</span>';
+          }
+        }
+      } else if (r.checkerUnknown) {
+        // 检查软件自己都没认出是哪个词（报告写「未知」）——不能当误报藏掉，要人工看
+        checkerNote = ' <span class="tag" data-tip="保密检查软件报告此文件命中，但「命中关键字」列写的是「未知」，它自己都没识别出是哪个词；本工具按当前词库复检 '
+          + r.hits + ' 处。此类行需人工复核，不做自动隐藏">检查软件未识别词</span>';
+      }
+      // v4.94：把外部检查系统报告里的原结论并排显示出来。
+      //   此前导入时这几列被直接丢弃，复核者只能看到本工具算出的占比 / 密级，
+      //   无从判断「对方说 25%、我们说 0%」这类分歧——分歧往往正是最该看的地方。
+      if (r.fromReport) {
+        var parts2 = [];
+        if (r.checkerRatio > 0) parts2.push('占比 ' + fmtRatio(r.checkerRatio));
+        if (r.checkerMarkLevel) parts2.push('密级 ' + r.checkerMarkLevel);
+        if (r.checkerVerdict) parts2.push(r.checkerVerdict);
+        if (r.checkerCat) parts2.push('类别 ' + r.checkerCat);
+        if (parts2.length) {
+          checkerNote += ' <span class="tag other" data-tip="外部检查系统报告里的原始结论（留档对照）：'
+            + escapeHtml(parts2.join(' · '))
+            + '。本工具复检结果与之不一致时，建议人工复核">原报告</span>';
         }
       }
       tr.setAttribute('data-tip', '点击预览此文件的命中情况与处理结果');
@@ -2827,8 +3348,12 @@ async function scanFolder() {
             : '该格式只能只读检测（.doc/.rtf/.pdf/.zip 等），不能原地清除；请转存为 .docx 后处理') + '">'
           + (r.nameOnly ? '仅文件名' : '仅检测') + '</span>' : '')
         + (r.imageOnly && !r.nameOnly ? ' <span class="tag other" data-tip="扫描件 PDF：无可读文本层（只有图片流），需人工复核或另存为文本格式">扫描件</span>' : '')
+        + (r.nameHit ? ' <span class="tag other" data-tip="保密检查软件按「文件名 + 正文」一起检索。此文件名本身含敏感词（如「内部资料.pdf」），正文之外仍会被报出——需重命名或人工复核">文件名</span>' : '')
+        + (r.skipped ? ' <span class="tag other" data-tip="本次跳过：复核人判定这一轮不处理、不删除。该行仍保留在结果表与报告里，作为「已复核、决定不动」的凭据">已跳过</span>' : '')
         + '</td>' +
-        '<td data-tip="' + (r.totalChars > 0 ? escapeHtml('命中 ' + (r.hitChars || 0) + ' / 全文 ' + r.totalChars + ' 字') : '全文无有效字符') + '">' + fmtRatio(r.ratio) + '</td>' +
+        scanLevelCell(r) +
+        '<td data-tip="' + (r.totalChars > 0 ? escapeHtml('命中 ' + (r.hitChars || 0) + ' / 全文 ' + r.totalChars + ' 字') : '全文无有效字符') + '">'
+        + fmtRatio(r.ratio) + tierTag(r.ratio) + '</td>' +
         '<td>' + r.hits + ' 处' + checkerNote + (r.residue
           ? ' <span class="tag bad" data-tip="清除后自检仍发现的残留处数">残留 ' + r.residue + '</span>' : '') + '</td>' +
 
@@ -2839,13 +3364,28 @@ async function scanFolder() {
       addBtn.type = 'button';
       addBtn.className = 'row-add';
       addBtn.textContent = r.detectOnly ? '转存' : '加入';
-      addBtn.disabled = !!r.detectOnly;
-      addBtn.setAttribute('data-tip', r.detectOnly
-        ? '需先用 Office / WPS 另存为 .docx，才能加入处理列表'
-        : '把该文档加入处理列表（加入后自动移出扫描结果）');
+      addBtn.disabled = !!r.detectOnly || !!r.skipped;
+      addBtn.setAttribute('data-tip', r.skipped
+        ? '本次跳过：这一轮不处理、不删除。先点行末「恢复」才能加入处理列表'
+        : (r.detectOnly
+          ? '需先用 Office / WPS 另存为 .docx，才能加入处理列表'
+          : '把该文档加入处理列表（加入后自动移出扫描结果）'));
       addBtn.addEventListener('click', function (e) {
         if (e && e.stopPropagation) e.stopPropagation();
         if (!addScanRows([r])) log('该文档已在处理列表中：' + r.path, 'warn');
+      });
+      // v4.94：本次跳过。复核人判定某个文件这一轮不动时用它——
+      //   该行仍留在结果表与报告里（注明「已跳过」），但不参与任何批量动作。
+      var skipBtn = document.createElement('button');
+      skipBtn.type = 'button';
+      skipBtn.className = 'row-skip' + (r.skipped ? ' on' : '');
+      skipBtn.textContent = r.skipped ? '恢复' : '跳过';
+      skipBtn.setAttribute('data-tip', r.skipped
+        ? '恢复：重新参与勾选与批量处理'
+        : '本次跳过：这一轮不处理、不删除，但保留在结果与报告里作为「已复核、决定不动」的凭据');
+      skipBtn.addEventListener('click', function (e) {
+        if (e && e.stopPropagation) e.stopPropagation();
+        toggleSkipRow(r);
       });
       var delBtn = document.createElement('button');
       delBtn.type = 'button';
@@ -2867,6 +3407,7 @@ async function scanFolder() {
         });
       });
       tdOp.appendChild(addBtn);
+      tdOp.appendChild(skipBtn);
       tdOp.appendChild(delBtn);
       tr.appendChild(tdOp);
       body.appendChild(tr);
@@ -2883,16 +3424,32 @@ async function scanFolder() {
    */
   function scanWordsCell(r) {
     var words = (r && r.matched) || [];
-    if (!words.length) return '<td>—</td>';
+    var xw = (r && r.checkerOnlyWords) || [];
+    var ow = (r && r.oursOnlyWords) || [];
     var html = words.map(function (w) {
       var n = scanRowsWithWord(w);
       return '<button type="button" class="kw-btn" data-word="' + escapeHtml(w) + '"'
         + ' data-tip="选中所有命中「' + escapeHtml(w) + '」的 ' + n + ' 行"'
         + ' aria-label="选中所有命中 ' + escapeHtml(w) + ' 的行">' + escapeHtml(w) + '</button>';
     }).join('');
+    // v4.84 词级交叉校验：把「检查软件报了但我们没命中」和「我们报了但检查软件没报」
+    // 摆在词列里。漏检是硬伤——清完仍会被检查软件报出，必须人工处理或补词库。
+    var extra = '';
+    if (xw.length) {
+      extra += ' <span class="tag bad" data-tip="' + escapeHtml(
+        '检查软件报告命中「' + xw.join('、') + '」，但按当前词库复检没命中：'
+        + '这些词清不掉，处理后仍会被检查软件报出。请人工处理，或在规则编辑器里补上该词。')
+        + '">漏检 ' + xw.length + ' 词</span>';
+    }
+    if (ow.length) {
+      extra += ' <span class="tag other" data-tip="' + escapeHtml(
+        '本工具命中「' + ow.join('、') + '」，检查软件没报：多半是它词库里没有的词（如公文文号），'
+        + '清除后不影响合规。') + '">多报 ' + ow.length + ' 词</span>';
+    }
+    if (!words.length && !extra) return '<td>—</td>';
     // 悬停就看出「词在哪个部件」：备注 / 图表 / 文档属性里的密级标识，正文翻不到
     var tip = hitPartsText(r.parts, 8);
-    return '<td class="words-cell"' + (tip ? ' data-tip="' + escapeHtml(tip) + '"' : '') + '>' + html + '</td>';
+    return '<td class="words-cell"' + (tip ? ' data-tip="' + escapeHtml(tip) + '"' : '') + '>' + html + extra + '</td>';
   }
 
   /** 当前可见结果里，命中词包含 w 的行数 */
@@ -2931,7 +3488,11 @@ async function scanFolder() {
     var btn = $('addScanToFiles');
     if (!btn) return;
     updateScanReportBtn();
-    var n = state.scanResults.filter(function (r) { return r.selected && !r.detectOnly; }).length;
+    // v4.94：计数只算「这次真的会被处理」的行——跳过的文件不计入，
+    //   否则按钮上写着「加入处理列表（12）」而实际只会处理 10 个，是误导。
+    var n = state.scanResults.filter(function (r) {
+      return r.selected && !r.detectOnly && !r.skipped;
+    }).length;
     btn.textContent = '加入处理列表（' + n + '）';
     btn.disabled = (n === 0);
     var del = $('scanDelSelBtn');
@@ -2942,6 +3503,14 @@ async function scanFolder() {
     if (delDiskBtn) delDiskBtn.disabled = (n === 0);
     var verifyBtn = $('scanVerifyBtn');
     if (verifyBtn) verifyBtn.disabled = (n === 0);
+    // v4.94：跳过按钮的可用状态——「跳过选中」要至少有一个已选且未跳过的；
+    //   「恢复全部跳过」要当前确实有跳过项。
+    var skipSelBtn = $('scanSkipSelBtn');
+    if (skipSelBtn) {
+      skipSelBtn.disabled = !state.scanResults.some(function (r) { return r.selected && !r.skipped; });
+    }
+    var skipResetBtn = $('scanSkipResetBtn');
+    if (skipResetBtn) skipResetBtn.disabled = (scanSkippedCount() === 0);
     var rsBtn = $('scanRescreenBtn');
     if (rsBtn) {
       rsBtn.disabled = state.importing || !state.scanResults.some(function (r) {
@@ -2968,6 +3537,10 @@ async function scanFolder() {
     if (json) json.disabled = !on;
     var htmlBtn = $('scanReportHtmlBtn');
     if (htmlBtn) htmlBtn.disabled = !on;
+    var docxBtn = $('scanReportDocxBtn');
+    if (docxBtn) docxBtn.disabled = !on;
+    var xmlBtn = $('scanReportXmlBtn');
+    if (xmlBtn) xmlBtn.disabled = !on;
   }
 
   /** 扫描报告明细行：取本次扫描的全量命中（「加入处理列表」不移除，「删除选中」才移除） */
@@ -2976,19 +3549,102 @@ async function scanFolder() {
       return {
         path: r.path,
         kind: kindLabel(fileKind(r.path)),
+        // v4.87：文件类别 / 修改时间 / 判定密级 / 越级存储
+        cat: DWRUtil.fileCatLabel(r.cat || DWRUtil.fileCatOf(r.path)),
+        mtime: fmtMtime(r.mtime),
         size: fmtSize(r.size),
         hits: r.hits,
         matched: (r.matched || []).join(' / '),
         ratio: fmtRatio(r.ratio),
-        mode: r.nameOnly ? '仅文件名' : (r.imageOnly ? '扫描件' : (r.detectOnly ? '仅检测' : '可处理')),
-        parts: hitPartsText(r.parts, 6)
+        level: r.level || '',
+        over: r.over ? '越级存储' : '',
+        // v4.89：涉密情况（对应外部检查系统结果表的「涉密情况」列）
+        //   与占比档位（外部检查系统按 25/50/75/100 四档给复核优先级）
+        verdict: DWRUtil.secrecyVerdict(r.level, r.over),
+        tier: (function () {
+          var k = DWRUtil.riskTier(r.ratio);
+          return k ? (DWRUtil.riskTierLabel(k) + '（' + k + '）') : '';
+        })(),
+        mode: r.skipped ? '已跳过'
+          : (r.nameOnly ? '仅文件名'
+            : (r.imageOnly ? '扫描件'
+              : (r.nameHit ? (r.contentHits > 0 ? '文件名+正文' : '仅文件名命中')
+                : (r.detectOnly ? '仅检测' : '可处理')))),
+        parts: hitPartsText(r.parts, 6),
+        // v4.94：外部检查系统报告里的原结论（导入行才有），随报告一并导出，
+        //   交出去时能看出「谁说的、说的是什么」，而不只是本工具的单边结论。
+        ctime: r.ctime ? fmtMtime(r.ctime) : '',
+        checkerRatio: r.checkerRatio > 0 ? fmtRatio(r.checkerRatio) : '',
+        checkerMarkLevel: r.checkerMarkLevel || '',
+        checkerVerdict: r.checkerVerdict || '',
+        checkerCat: r.checkerCat || '',
+        // v4.84 词级交叉校验：漏检词清不掉，必须人工处理；多报词清掉无碍
+        cross: r.fromReport ? crossCheckText(r) : ''
       };
     });
+  }
+
+  /** 词级交叉校验的导出文本：「漏检: 内部 / 多报: 国发」 */
+  function crossCheckText(r) {
+    var out = [];
+    if ((r.checkerOnlyWords || []).length) out.push('漏检: ' + r.checkerOnlyWords.join('、'));
+    if ((r.oursOnlyWords || []).length) out.push('多报: ' + r.oursOnlyWords.join('、'));
+    if (r.checkerUnknown) out.push('检查软件未识别关键词');
+    return out.join(' / ');
   }
 
   /** 命中占比：0 或无分母时显示 -，其余保留一位小数的百分比 */
   function fmtRatio(v) {
     return v > 0 && isFinite(v) ? (v * 100).toFixed(1) + '%' : '-';
+  }
+
+  /** v4.89：扫描归档里满足条件的行数（报告汇总用） */
+  function scanArchiveCount(fn) {
+    return (state.scanArchive || []).filter(fn).length;
+  }
+
+  /**
+   * v4.89：命中占比的档位标签。
+   * 外部保密检查系统把命中占比分成四档给人看优先级，我们沿用同一口径
+   * （≥75% 极高、≥50% 高、≥25% 中、其余 低），标签写清档位与含义。
+   */
+  function tierTag(ratio) {
+    var key = DWRUtil.riskTier(ratio);
+    if (!key) return '';
+    var label = DWRUtil.riskTierLabel(key);
+    var tips = {
+      extreme: '极高：四分之三以上的正文都是敏感内容，几乎整篇涉密，复核优先处理',
+      high: '高：过半正文是敏感内容',
+      mid: '中：约四分之一到一半正文是敏感内容',
+      low: '低：少量正文命中，大概率是正文里的密级标识或简称'
+    };
+    return ' <span class="tag tier-' + key + '" data-tip="' + escapeHtml(tips[key] || '') + '">'
+      + escapeHtml(label) + '</span>';
+  }
+
+  /**
+   * v4.87：结果表的「密级」单元格。
+   * 文件密级由命中词推导（绝密 > 机密 > 秘密 > 内部）；
+   * 高于本机定密级的标「越级」——对应外部保密检查系统的自动判定项「越级存储密标文件」。
+   */
+  function scanLevelCell(r) {
+    if (!r || !r.level) return '<td class="muted">—</td>';
+    var lv = r.level;
+    var tip = '按命中词判定的文件密级：' + lv;
+    if (r.over) tip += '；高于本机定密级（' + machineLevelVal() + '），属越级存储';
+    var cls = (r.over || lv === '绝密' || lv === '机密') ? 'bad' : 'other';
+    var html = '<span class="tag ' + cls + '" data-tip="' + escapeHtml(tip) + '">' + escapeHtml(lv) + '</span>';
+    if (r.over) html += ' <span class="tag bad" data-tip="文件密级高于本机定密级，属越级存储，需按密级管理要求处理">越级</span>';
+    return '<td>' + html + '</td>';
+  }
+
+  /** 修改时间：YYYY-MM-DD（拿不到就留空） */
+  function fmtMtime(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    if (isNaN(d.getTime())) return '';
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
   }
 
   /** 全部命中文件的平均命中占比（按文件加权，不是按命中字数总和重新算） */
@@ -3012,6 +3668,13 @@ async function scanFolder() {
       ['仅文件名命中数', s.nameOnly || 0, 'obs', '正文未读取（格式不支持 / 超大 / 读不动）但文件名含敏感词的命中数；检查软件按「文件名 + 正文」检索照样报出，需重命名或人工复核'],
       ['未检查文件数', skipTotal(s), 'obs', skipBreakdown(s) || '本次遇到的候选文件均已检查'],
       ['平均命中占比', fmtRatio(scanArchiveRatio()), 'der', '全部命中文件按文件加权的平均占比，回答这批文件整体有多涉密'],
+      // v4.89：标密 / 公开 / 越级三个分档——对齐外部保密检查系统的结果分页与自动判定项
+      ['标密文件数', scanArchiveCount(function (r) { return !!r.level; }), 'der',
+        '判定出密级（绝密 / 机密 / 秘密 / 内部）的文件数，对应外部检查系统的「标密文件」页签'],
+      ['判定为公开文件数', scanArchiveCount(rowJudgedPublic), 'der',
+        '已检查但全文没有密级标识的文件数，对应外部检查系统的「判定的公开文件」页签。未标密不等于可以对外发送，仍要按人工判定清单核对'],
+      ['越级存储文件数', scanArchiveCount(function (r) { return !!r.over; }), 'der',
+        '文件判定密级高于「本机定密级」的数量，对应外部检查系统的自动判定项「越级存储密标文件」'],
       ['文件数上限', s.maxFiles, 'obs', '本次扫描的设置值'],
       ['最大深度', s.maxDepth],
       ['跳过系统目录', s.skipSys ? '是' : '否'],
@@ -3024,21 +3687,53 @@ async function scanFolder() {
     if (s.fromReport) {
       rows.splice(4, 0,
         ['检查软件报告命中', s.checkerHits || 0],
-        ['复检误报（本工具 0 命中）', s.falsePos || 0]);
+        ['复检误报（本工具 0 命中）', s.falsePos || 0],
+        ['漏检（检查软件报了、本工具未命中）', s.checkerOnlyFiles || 0, 'obs',
+          '词级交叉校验结果：检查软件报了某个词，但按当前词库复检没命中。这些词清不掉，处理后仍会被检查软件报出，需人工处理或补词库'],
+        ['多报（本工具报了、检查软件未报）', s.oursOnlyFiles || 0, 'obs',
+          '词级交叉校验结果：本工具命中但检查软件没报的词，多半是它词库里没有的词，清除后不影响合规'],
+        ['检查软件未识别关键词', s.checkerUnknownFiles || 0, 'obs',
+          '报告「命中关键字」列写的是「未知」——检查软件自己都没认出是哪个词，此类行需人工复核，不自动隐藏']);
     }
     return rows;
   }
 
   /** 导出扫描报告 CSV（UTF-8 BOM + CRLF，Excel 可直接打开） */
   /** v3.6 导出 HTML 检查报告：A4 单页，可打印成 PDF 给合规 / 审计 */
-  function exportScanReportHtml() {
-    if (!state.lastScan || !state.scanArchive.length) { log('还没有可导出的扫描结果', 'warn'); return; }
+  /* v4.91：扫描报告的数据模型。HTML 报告与 Word 报告共用这一份，
+     避免两种格式各算一遍、口径慢慢漂开。 */
+  function scanReportModel() {
+    if (!state.lastScan || !state.scanArchive.length) { log('还没有可导出的扫描结果', 'warn'); return null; }
     // 直接取 scanArchive 原始行：matched 是数组（scanReportRows() 已 join 成字符串，给 CSV 用）
     var rows = state.scanArchive.map(function (r) {
       var st = 'hit';
       if (r.detectOnly) st = 'detect';
       else if (r.fromReport) st = r.checked ? (r.hits ? 'hit' : 'clean') : 'pending';
-      return { file: r.path, hits: r.hits, matched: r.matched || [], status: st, ratio: fmtRatio(r.ratio), parts: hitPartsText(r.parts, 6) };
+      // v4.94：本次跳过的文件在报告里注明「已跳过」——
+      //   它确实被复核过并被判定为不动，和「没看过」不是一回事，报告要能区分。
+      if (r.skipped) st = 'skipped';
+      return {
+        file: r.path, hits: r.hits, matched: r.matched || [], status: st,
+        ratio: fmtRatio(r.ratio), parts: hitPartsText(r.parts, 6),
+        // v4.87：类别 / 修改时间 / 判定密级 / 越级存储
+        cat: DWRUtil.fileCatLabel(r.cat || DWRUtil.fileCatOf(r.path)),
+        mtime: fmtMtime(r.mtime),
+        level: r.level || '',
+        over: r.over ? '越级存储' : '',
+        // v4.89：涉密情况 + 占比档位
+        verdict: DWRUtil.secrecyVerdict(r.level, r.over),
+        tier: (function () {
+          var k = DWRUtil.riskTier(r.ratio);
+          return k ? (DWRUtil.riskTierLabel(k) + '（' + k + '）') : '';
+        })(),
+        cross: r.fromReport ? crossCheckText(r) : '',
+        // v4.94：外部检查系统报告里的原结论（原样留档并导出）
+        ctime: r.ctime ? fmtMtime(r.ctime) : '',
+        checkerRatio: r.checkerRatio > 0 ? fmtRatio(r.checkerRatio) : '',
+        checkerMarkLevel: r.checkerMarkLevel || '',
+        checkerVerdict: r.checkerVerdict || '',
+        checkerCat: r.checkerCat || ''
+      };
     });
     var s0 = state.lastScan;
     var concl = '本次扫描按当前词库检查了 ' + (s0.checked || s0.scanned) + ' 个文件，其中 ' + s0.hitFiles + ' 个命中、共 ' + s0.totalHits + ' 处。';
@@ -3057,62 +3752,148 @@ async function scanFolder() {
       '按「' + scopeLabel(checkedVal('scope')) + '」范围处理，再按全文复查一遍范围外的残留。',
       '逐文件统计命中处数与命中词，汇总成本报告。'
     ];
-    var html = DWRReportHtml.build({
-      title: '文档敏感词扫描报告',
-      generatedAt: tsName(),
-      conclusion: concl,
-      summary: scanSummary(),
+    var reportCols = [
+      { k: 'file', label: '文件路径' },
+      { k: 'ratio', label: '命中占比', width: '70px' },
+      { k: 'hits', label: '命中处数', width: '70px' },
+      { k: 'matched', label: '命中词' },
+      { k: 'parts', label: '命中位置' },
+      { k: 'status', label: '状态', width: '80px' }
+    ];
+    // v4.87：补上外部保密检查系统结果表里的几列——文件类别 / 修改时间 / 判定密级（越级）
+    reportCols.splice(5, 0,
+      { k: 'cat', label: '文件类别', width: '80px' },
+      { k: 'mtime', label: '修改时间', width: '90px' },
+      { k: 'level', label: '判定密级', width: '80px' },
+      { k: 'over', label: '越级', width: '70px' });
+    // v4.89：补「涉密情况」与「占比档位」两列——对齐外部检查系统结果表，
+    //   涉密情况给出人工复核要的结论，占比档位给出复核优先级。
+    reportCols.splice(9, 0,
+      { k: 'verdict', label: '涉密情况', width: '110px' },
+      { k: 'tier', label: '占比档位', width: '80px' });
+    // v4.84：导入外部报告时多一列词级交叉校验结论（漏检 / 多报）
+    if (s0.fromReport) {
+      var crossIdx = reportCols.findIndex(function (c) { return c.k === 'parts'; });
+      reportCols.splice(crossIdx + 1, 0, { k: 'cross', label: '词级交叉校验', width: '160px' });
+      // v4.94：外部检查系统报告里的原结论，原样随报告导出。
+      //   报告交出去后，接收方能同时看到「检查软件怎么说」与「本工具怎么说」，
+      //   不必再回头翻原始 HTML 报告才能对上口径。
+      reportCols.splice(crossIdx + 1, 0,
+        { k: 'checkerRatio', label: '原报告占比', width: '90px' },
+        { k: 'checkerMarkLevel', label: '原报告密级', width: '90px' },
+        { k: 'checkerVerdict', label: '原报告涉密情况', width: '120px' });
+    }
+    return {
       rows: rows,
-      cols: [
-        { k: 'file', label: '文件路径' },
-        { k: 'ratio', label: '命中占比', width: '70px' },
-        { k: 'hits', label: '命中处数', width: '70px' },
-        { k: 'matched', label: '命中词' },
-        { k: 'parts', label: '命中位置' },
-        { k: 'status', label: '状态', width: '80px' }
-      ],
-      steps: steps,
-      extraLimits: extraLimits,
-      review: s0.review || scanReviewNote,
-      reviewList: reviewListText(),
-      note: '本报告由本地工具生成，数据未离开本机；「命中」为按当前词库复检的结果。'
-    });
+      cols: reportCols,
+      opts: {
+        title: '文档敏感词扫描报告',
+        generatedAt: tsName(),
+        conclusion: concl,
+        summary: scanSummary(),
+        rows: rows,
+        cols: reportCols,
+        steps: steps,
+        extraLimits: extraLimits,
+        review: s0.review || scanReviewNote,
+        reviewList: reviewListText(),
+        note: '本报告由本地工具生成，数据未离开本机；「命中」为按当前词库复检的结果。'
+      }
+    };
+  }
+
+  function exportScanReportHtml() {
+    var m = scanReportModel();
+    if (!m) return;
+    var html = DWRReportHtml.build(m.opts);
     download(new Blob([html], { type: 'text/html' }), '扫描报告_' + tsName() + '.html');
-    log('已导出 HTML 扫描报告（' + rows.length + ' 个命中文件，可用浏览器打印成 PDF）', 'ok');
+    log('已导出 HTML 扫描报告（' + m.rows.length + ' 个命中文件，可用浏览器打印成 PDF）', 'ok');
+  }
+
+  /* v4.91：导出 Word 版扫描报告（.docx）。零依赖，用自带的 zip 打包器生成 OOXML。 */
+  function exportScanReportDocx() {
+    var m = scanReportModel();
+    if (!m) return;
+    DWRReportDocx.build(m.opts).then(function (blob) {
+      download(blob, '扫描报告_' + tsName() + '.docx');
+      log('已导出 Word 扫描报告（' + m.rows.length + ' 个命中文件，可直接用 Word 打开）', 'ok');
+    }).catch(function (e) {
+      log('Word 报告生成失败：' + (e && e.message ? e.message : e), 'err');
+    });
+  }
+
+  /* v4.92：导出 XML 版扫描报告（.xml）。对接外部保密检查系统 / 整改台账时直接给文件。 */
+  function exportScanReportXml() {
+    var m = scanReportModel();
+    if (!m) return;
+    var blob = DWRReportXml.build(m.opts);
+    download(blob, '扫描报告_' + tsName() + '.xml');
+    log('已导出 XML 扫描报告（' + m.rows.length + ' 个命中文件，可直接被其他系统读取）', 'ok');
   }
 
   /** v3.6 清除记录的 HTML 版 */
-  function exportCleanReportHtml() {
+  /* v4.92：清除报告的模型（HTML / Word / XML 三种导出共用一份，避免三处口径走偏） */
+  function cleanReportModel() {
     var run = state.lastRun;
-    if (!run) { log('还没有可导出的处理记录', 'warn'); return; }
+    if (!run) return null;
     var rows = state.files.map(function (f) {
       return { file: f.path, hits: f.status === 'done' ? (f.hits || 0) : 0, matched: f.matched || [], status: f.status };
     });
-    var html = DWRReportHtml.build({
-      title: '文档敏感词清除报告',
-      generatedAt: run.time,
-      conclusion: '本次处理 ' + run.total + ' 个文件，修改 ' + run.changed + ' 个，共清除敏感词 ' + run.hits + ' 处。' + (run.changed ? '已按所选输出方式交付，可人工复核后分发。' : '未发现需要修改的内容。'),
-      summary: [
-        ['文件总数', run.total, 'obs', '本次加入处理的文件数'],
-        ['修改文件数', run.changed, 'obs', '内容发生变化的文件数'],
-        ['清除敏感词处数', run.hits, 'obs', '全部命中位置的总和'],
-        ['启用规则数', run.rules, 'obs', '本次生效的词条数（停用的不计）'],
-        ['作用范围', run.scope, 'obs', '本次处理的设置值'],
-        ['命中后处理', run.action, 'obs', '本次处理的设置值'],
-        ['输出方式', run.out, 'obs', '本次处理的设置值']
-      ],
+    return {
       rows: rows,
-      steps: [
-        '按当前词库对文件全文做归一化匹配（剔除零宽字符、折叠全角与空格、容忍符号插字与繁体写法）。',
-        'Word / Excel / PPT 直接改写内部 XML，覆盖正文、页眉页脚、脚注批注、文本框与元数据。',
-        '按「' + run.scope + '」范围处理，命中后' + run.action + '，再按全文复查一遍范围外的残留。',
-        '逐文件统计清除处数，汇总成本报告。'
-      ],
-      review: run.review || reviewNote,
-      note: '本报告由本地工具生成，数据未离开本机。'
-    });
+      opts: {
+        title: '文档敏感词清除报告',
+        generatedAt: run.time,
+        conclusion: '本次处理 ' + run.total + ' 个文件，修改 ' + run.changed + ' 个，共清除敏感词 ' + run.hits + ' 处。' + (run.changed ? '已按所选输出方式交付，可人工复核后分发。' : '未发现需要修改的内容。'),
+        summary: [
+          ['文件总数', run.total, 'obs', '本次加入处理的文件数'],
+          ['修改文件数', run.changed, 'obs', '内容发生变化的文件数'],
+          ['清除敏感词处数', run.hits, 'obs', '全部命中位置的总和'],
+          ['启用规则数', run.rules, 'obs', '本次生效的词条数（停用的不计）'],
+          ['作用范围', run.scope, 'obs', '本次处理的设置值'],
+          ['命中后处理', run.action, 'obs', '本次处理的设置值'],
+          ['输出方式', run.out, 'obs', '本次处理的设置值']
+        ],
+        rows: rows,
+        steps: [
+          '按当前词库对文件全文做归一化匹配（剔除零宽字符、折叠全角与空格、容忍符号插字与繁体写法）。',
+          'Word / Excel / PPT 直接改写内部 XML，覆盖正文、页眉页脚、脚注批注、文本框与元数据。',
+          '按「' + run.scope + '」范围处理，命中后' + run.action + '，再按全文复查一遍范围外的残留。',
+          '逐文件统计清除处数，汇总成本报告。'
+        ],
+        review: run.review || reviewNote,
+        note: '本报告由本地工具生成，数据未离开本机。'
+      }
+    };
+  }
+
+  function exportCleanReportHtml() {
+    var m = cleanReportModel();
+    if (!m) { log('还没有可导出的处理记录', 'warn'); return; }
+    var html = DWRReportHtml.build(m.opts);
     download(new Blob([html], { type: 'text/html' }), '清除报告_' + tsName() + '.html');
-    log('已导出 HTML 清除报告（' + rows.length + ' 个文件，可用浏览器打印成 PDF）', 'ok');
+    log('已导出 HTML 清除报告（' + m.rows.length + ' 个文件，可用浏览器打印成 PDF）', 'ok');
+  }
+
+  /* v4.91：导出 Word 版清除报告（.docx）。整改报告常要直接改、盖章、走签批。 */
+  function exportCleanReportDocx() {
+    var m = cleanReportModel();
+    if (!m) { log('还没有可导出的处理记录', 'warn'); return; }
+    DWRReportDocx.build(m.opts).then(function (blob) {
+      download(blob, '清除报告_' + tsName() + '.docx');
+      log('已导出 Word 清除报告（' + m.rows.length + ' 个文件，可直接用 Word 打开）', 'ok');
+    }).catch(function (e) {
+      log('Word 报告生成失败：' + (e && e.message ? e.message : e), 'err');
+    });
+  }
+
+  /* v4.92：导出 XML 版清除报告（.xml）。给别的系统读：整改台账、归档脚本都能直接吃。 */
+  function exportCleanReportXml() {
+    var m = cleanReportModel();
+    if (!m) { log('还没有可导出的处理记录', 'warn'); return; }
+    var blob = DWRReportXml.build(m.opts);
+    download(blob, '清除报告_' + tsName() + '.xml');
+    log('已导出 XML 清除报告（' + m.rows.length + ' 个文件，可直接被其他系统读取）', 'ok');
   }
 
   /** v4.0 复核意见输入绑定：任何改动立即生效（导出时才读取） */
@@ -3121,9 +3902,13 @@ async function scanFolder() {
     var preset = $('scanExtPreset');
     var wrap = $('scanExtCustomWrap');
     if (wrap) wrap.style.display = (preset && preset.value === 'custom') ? 'block' : 'none';
+    // v4.87：类别多选面板（对应外部保密检查系统的「检查文件类型」多选）
+    var catWrap = $('scanCatWrap');
+    if (catWrap) catWrap.style.display = (preset && preset.value === 'cats') ? 'block' : 'none';
   }
 
   function bindExtFilter() {
+    renderCatPicker();
     var preset = $('scanExtPreset');
     if (preset) {
       syncExtPresetUi();
@@ -3137,11 +3922,44 @@ async function scanFolder() {
     }
     var cust = $('scanExtCustom');
     if (cust) cust.addEventListener('input', function () { applyExtFilter(); saveSettings(); });
+    // v4.87 类别多选：勾选即生效（下一轮扫描用）
+    var catBox = $('scanCatBox');
+    if (catBox) {
+      catBox.addEventListener('change', function (e) {
+        var t = e && e.target;
+        if (!t || !t.value) return;
+        var i = (state.scanCats || []).indexOf(t.value);
+        if (t.checked && i < 0) state.scanCats.push(t.value);
+        if (!t.checked && i >= 0) state.scanCats.splice(i, 1);
+        applyExtFilter();
+        saveSettings();
+        var cats = selectedCats();
+        var n = Doc.getExtFilter ? Doc.getExtFilter() : null;
+        log('文件类别：' + (cats.length ? cats.map(DWRUtil.fileCatLabel).join('、') : '未选（按主流格式）')
+          + '（' + (n ? n.length + ' 种扩展名' : '不限扩展名') + '）', 'info');
+      });
+    }
     // v4.10 文件名关键字：改动即存，不即时生效（下一轮扫描才用）
     var nw = $('scanNameWords');
     if (nw) nw.addEventListener('input', function () { saveSettings(); });
     var nm = $('scanNameMode');
     if (nm) nm.addEventListener('change', function () { saveSettings(); });
+    // v4.87 文件名与内容关系：下一轮扫描生效
+    var nr = $('scanNameRel');
+    if (nr) nr.addEventListener('change', function () { saveSettings(); });
+    // v4.87 本机定密级：改动后立刻重算已有结果的越级标记
+    var ml = $('scanMachineLevel');
+    if (ml) {
+      ml.addEventListener('change', function () {
+        saveSettings();
+        var lv = machineLevelVal();
+        state.scanResults.forEach(function (r) { applyLevelMeta(r, lv); });
+        state.scanArchive.forEach(function (r) { applyLevelMeta(r, lv); });
+        renderScanTally();
+        scanTableChanged(true);
+        if (lv) log('本机定密级：' + lv + '（文件密级高于它的会标「越级」）', 'info');
+      });
+    }
   }
 
   /* v4.8 结构化复核清单：把常见人工检查项改造成文档脱敏场景。
@@ -3297,7 +4115,37 @@ async function scanFolder() {
 
   /** 当前勾选、且带目录 / 文件句柄（来自「扫描文件夹」）的命中行 */
   function selectedScanTargets() {
-    return state.scanResults.filter(function (r) { return r.selected && r.handle && !r.detectOnly; });
+    // v4.94：本次跳过的文件不参与任何批量动作（一键处理 / 删除 / 加入处理列表 / 检查残留）。
+    //   外部保密检查系统在结果表里就有「跳过此文件」——复核人判定某个文件不该动时，
+    //   需要能把它从这轮里摘出去，但**留在报告里**作为「已看过、决定不动」的凭据，
+    //   而不是「移出结果」那样把痕迹一起抹掉。
+    return state.scanResults.filter(function (r) {
+      return r.selected && r.handle && !r.detectOnly && !r.skipped;
+    });
+  }
+
+  /**
+   * v4.94：本次跳过 / 恢复某个文件。
+   * 与「移出结果」的区别：移出是把这一行从结果表和报告里一起删掉；
+   * 「本次跳过」是复核人判定这个文件这一轮不动——它仍然出现在报告里，
+   * 并在「状态」列注明「已跳过」，作为「看过了、决定不动」的凭据。
+   * 跳过只影响这一轮，不写进设置、不影响下次扫描。
+   */
+  function toggleSkipRow(r) {
+    if (!r) return;
+    r.skipped = !r.skipped;
+    // 跳过的行同时取消勾选：即便用户之后又勾上，批量动作仍会跳过它——
+    // 否则「已勾选」的视觉状态会让人以为它会被处理。
+    if (r.skipped) r.selected = false;
+    renderScanResults();
+    updateScanAddBtn();
+    log((r.skipped ? '已跳过（本次不动，仍留在报告里）：' : '已恢复，可参与处理：')
+      + (r.path || ''), 'info');
+  }
+
+  /** 当前被跳过（本次不动）的行数 */
+  function scanSkippedCount() {
+    return state.scanResults.filter(function (r) { return r.skipped; }).length;
   }
 
   /** 一键处理选中：清理命中文档并写回原位置（默认先备份 .bak，受「输出方式 · 备份」开关控制） */
@@ -3531,6 +4379,20 @@ async function scanFolder() {
 
   /** 自检引擎：规则与当前词库一致，范围固定「全文」——外部保密检查软件不会只查首尾行 */
   function buildVerifyEngine() {
+    var cfg = buildConfig();
+    cfg.scope = 'all';
+    return Rules.createEngine(cfg);
+  }
+
+  /**
+   * 导入外部检查软件报告后的「复检」专用引擎：作用范围固定为全文。
+   *
+   * 为什么不用界面上的范围选择（默认首行 + 尾行）：外部保密检查软件一律按全文检索，
+   * 复检必须与它同口径，否则「正文中间才出现密级词」的文件会被复检成 0 命中，
+   * 自动标成误报、取消勾选并隐藏——文件照原样分发出去，仍会被检查软件报出来。
+   * 界面的范围选择只影响真正动手清除的那一步（见 buildEngine），两者互不干扰。
+   */
+  function buildRecheckEngine() {
     var cfg = buildConfig();
     cfg.scope = 'all';
     return Rules.createEngine(cfg);
@@ -4083,6 +4945,10 @@ async function scanFolder() {
     if (jsonBtn) jsonBtn.disabled = btn.disabled;
     var htmlBtn = $('reportHtmlBtn');
     if (htmlBtn) htmlBtn.disabled = btn.disabled;
+    var docxBtn = $('reportDocxBtn');
+    if (docxBtn) docxBtn.disabled = btn.disabled;
+    var xmlBtn = $('reportXmlBtn');
+    if (xmlBtn) xmlBtn.disabled = btn.disabled;
   }
 
   /** 导出清除报告：CSV（UTF-8 BOM + CRLF，Excel 可直接打开） */
@@ -4936,6 +5802,8 @@ async function scanFolder() {
       }
       if (state.scanning) {
         state.scanCancel = true;
+        // v4.88：OCR worker 立刻收工，别让识别在后台继续吃 CPU
+        if (window.DWROcr) { try { window.DWROcr.terminate(); } catch (e) { /* 忽略 */ } }
         log('正在停止扫描…', 'warn');
       }
     });
@@ -5040,6 +5908,26 @@ async function scanFolder() {
     });
     var scanDelSelBtn = $('scanDelSelBtn');
     if (scanDelSelBtn) scanDelSelBtn.addEventListener('click', removeSelectedScan);
+    // v4.94：批量跳过 / 恢复。跳过的文件这一轮不参与任何动作，但仍留在结果与报告里。
+    var scanSkipSelBtn = $('scanSkipSelBtn');
+    if (scanSkipSelBtn) scanSkipSelBtn.addEventListener('click', function () {
+      var n = 0;
+      state.scanResults.forEach(function (r) {
+        if (r.selected && !r.skipped) { r.skipped = true; r.selected = false; n++; }
+      });
+      renderScanResults();
+      updateScanAddBtn();
+      log(n ? ('已把 ' + n + ' 个文件标记为「本次跳过」：这一轮不处理、不删除，仍保留在结果表与报告里')
+        : '没有可跳过的已选文件（已跳过的文件需先点行末「恢复」）', n ? 'info' : 'warn');
+    });
+    var scanSkipResetBtn = $('scanSkipResetBtn');
+    if (scanSkipResetBtn) scanSkipResetBtn.addEventListener('click', function () {
+      var n = scanSkippedCount();
+      state.scanResults.forEach(function (r) { r.skipped = false; });
+      renderScanResults();
+      updateScanAddBtn();
+      log(n ? ('已恢复 ' + n + ' 个跳过项，可重新参与处理') : '当前没有跳过项', n ? 'ok' : 'info');
+    });
     if ($('scanCleanBtn')) $('scanCleanBtn').addEventListener('click', function () {
       batchCleanSelected().catch(function (e) { log('一键处理异常：' + (e.message || e), 'err'); });
     });
@@ -5051,7 +5939,8 @@ async function scanFolder() {
       batchDeleteSelected().catch(function (e) { log('一键删除异常：' + (e.message || e), 'err'); });
     });
     $('addScanToFiles').addEventListener('click', function () {
-      var picked = state.scanResults.filter(function (r) { return r.selected; });
+      // v4.94：跳过的文件不加入处理列表——「本次跳过」就该在所有批量动作里一致生效。
+      var picked = state.scanResults.filter(function (r) { return r.selected && !r.skipped; });
       if (!picked.length) return;
       if (!addScanRows(picked)) log('选中的文档已在处理列表中。', 'warn');
     });
@@ -5067,6 +5956,10 @@ async function scanFolder() {
     // v3.6 HTML 检查报告（A4 单页，可打印成 PDF）
     if ($('scanReportHtmlBtn')) $('scanReportHtmlBtn').addEventListener('click', function () { exportScanReportHtml(); });
     if ($('reportHtmlBtn')) $('reportHtmlBtn').addEventListener('click', function () { exportCleanReportHtml(); });
+    if ($('scanReportDocxBtn')) $('scanReportDocxBtn').addEventListener('click', function () { exportScanReportDocx(); });
+    if ($('reportDocxBtn')) $('reportDocxBtn').addEventListener('click', function () { exportCleanReportDocx(); });
+  if ($('scanReportXmlBtn')) $('scanReportXmlBtn').addEventListener('click', function () { exportScanReportXml(); });
+  if ($('reportXmlBtn')) $('reportXmlBtn').addEventListener('click', function () { exportCleanReportXml(); });
     $('reportBtn').addEventListener('click', function () { exportCleanReport(); });
     $('reportJsonBtn').addEventListener('click', function () { exportCleanReportJson(); });
 
@@ -5094,6 +5987,8 @@ async function scanFolder() {
   }
 
   function init() {
+    // v4.87：先生成类别多选控件，再读设置——否则恢复勾选时控件还不存在
+    renderCatPicker();
     var has = loadSettings();
     if (!has) loadPreset();
     // v2.82：有未处理文件时，关闭 / 刷新页面前提示一次，防止手滑丢工作现场。

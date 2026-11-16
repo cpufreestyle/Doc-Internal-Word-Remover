@@ -15,6 +15,13 @@ if (listed.status !== 0) {
 const files = listed.stdout.toString('utf8').split('\0').filter(Boolean);
 const forbiddenNames = /(^|\/)(HANDOVER(?:-log)?\.md|design-qa\.md|ui-benchmark-findings\.md|\.env(?:\.|$)|[^/]+\.(?:pem|key|p12|pfx))$/i;
 const binaryExt = /\.(?:png|ico|jpg|jpeg|gif|webp|woff2?|zip|gz|exe|mp4|pdf)$/i;
+/* 第三方产物豁免：随包分发的 OCR 识别内核（tesseract 的 WASM 构建）。
+   这些文件是压缩过的第三方产物，内部含 base64 数据块，会偶然匹配到
+   「AKIA + 16 位大写字母」这类密钥形状（那些字符串是 WASM 二进制里的常量，
+   不是 AWS 凭据）。逐行扫这种文件只会产出误报，
+   真正的凭据泄露风险来自我们自己写的代码与配置，所以只豁免这些 vendored 文件。
+   豁免范围限定在具体目录，不扩大到全仓库的 .js。 */
+const vendoredPaths = /^assets\/ocr\/core\//;
 const workstationPath = new RegExp(
   ['C:', '\\\\', 'Users', '\\\\'].join('') + '|' + ['D:', '\\\\', 'workspace', '\\\\'].join(''),
   'i'
@@ -34,6 +41,7 @@ for (const rel of files) {
     findings.push(rel + ': forbidden filename');
     continue;
   }
+  if (vendoredPaths.test(rel)) continue;
   if (binaryExt.test(rel)) continue;
   const full = path.join(root, rel);
   let buf;

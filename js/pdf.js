@@ -1214,8 +1214,82 @@
     return n;
   }
 
+  /* ---------------- 图片提取（供 OCR 文字检查用） ---------------- */
+
+  var MAX_OCR_IMAGES = 12;
+  var MAX_OCR_SAMPLE_BYTES = 24 * 1024 * 1024;
+
+  function dictNumber(dict, key) {
+    var m = new RegExp('\\' + key + '\\s+(\\d+)').exec(dict || '');
+    return m ? parseInt(m[1], 10) : 0;
+  }
+
+  function dictToken(dict, key) {
+    var m = new RegExp('\\' + key + '\\s*(\\[[^\\]]*\\]|/[^\\s/>]+)').exec(dict || '');
+    return m ? m[1] : '';
+  }
+
+  /**
+   * 取出 PDF 里的图片。
+   * 扫描件 PDF 就是一张张整页图——正文层没有文字，密级标识全在图上。
+   * DCTDecode 的直接就是 JPEG 字节；FlateDecode 的是原始采样，交给调用方栅格化。
+   * @param {Uint8Array} bytes
+   * @returns {Array<{name:string, mime:string, bytes?:Uint8Array, samples?:Uint8Array, width:number, height:number, channels:number}>}
+   */
+  function extractImages(bytes) {
+    var out = [];
+    if (!bytes || bytes.length < 16) return out;
+    if (!(bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46)) return out;
+    var ctx = {
+      raw: bytesToLatin1(bytes),
+      objs: null,
+      budget: { used: 0, limit: LIMITS.maxInflate },
+      fonts: new Map(),
+      crypt: null,
+      hasImage: false
+    };
+    ctx.objs = parseObjects(ctx.raw);
+    var idx = 0;
+    ctx.objs.forEach(function (rec) {
+      if (out.length >= MAX_OCR_IMAGES) return;
+      var d = rec.dict || '';
+      if (!/\/Subtype\s*\/Image\b/.test(d)) return;
+      if (!rec.body) return;
+      var filter = dictToken(d, '/Filter');
+      var w = dictNumber(d, '/Width');
+      var h = dictNumber(d, '/Height');
+      var bpc = dictNumber(d, '/BitsPerComponent') || 8;
+      var cs = dictToken(d, '/ColorSpace');
+      var raw = bytes.slice(rec.body.s, rec.body.e);
+      // stream 与 endstream 之间常有多余的 CR / LF，JPEG 尾字节必须干净
+      var rawEnd = raw.length;
+      while (rawEnd > 0 && (raw[rawEnd - 1] === 0x0a || raw[rawEnd - 1] === 0x0d
+        || raw[rawEnd - 1] === 0x20 || raw[rawEnd - 1] === 0x09)) rawEnd--;
+      raw = raw.subarray(0, rawEnd);
+      idx++;
+      if (/DCTDecode/.test(filter)) {
+        out.push({ name: 'PDF 图片 ' + idx, mime: 'image/jpeg', bytes: raw, width: w, height: h, channels: 3 });
+        return;
+      }
+      if (!/FlateDecode/.test(filter)) return;          // JPX / CCITT / JBIG2：浏览器解不了
+      if (bpc !== 8) return;                             // 1/4/16 位：先不做
+      if (/\/Predictor/.test(d)) return;                 // 带预测器的流：不做
+      var samples = inflateStream(raw, ctx.budget);
+      if (!samples || !samples.length) return;
+      var channels = /DeviceRGB|CalRGB/.test(cs) ? 3 : (/DeviceGray|CalGray/.test(cs) ? 1 : 0);
+      if (!channels) return;
+      if (w * h * channels > MAX_OCR_SAMPLE_BYTES) return;
+      out.push({
+        name: 'PDF 图片 ' + idx, mime: 'image/png',
+        samples: samples, width: w, height: h, channels: channels
+      });
+    });
+    return out;
+  }
+
   global.DWRPdf = {
     extract: extract,
+    extractImages: extractImages,
     LIMITS: LIMITS
   };
 })(typeof window !== 'undefined' ? window : globalThis);

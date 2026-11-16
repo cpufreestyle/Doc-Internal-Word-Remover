@@ -70,6 +70,15 @@
 
   var BOM = '\uFEFF';
 
+  /** 逐词命中次数表合并：把 src 的计数累加进 dst（v4.85） */
+  function mergeCounts(dst, src) {
+    if (!src) return dst;
+    for (var w in src) {
+      if (Object.prototype.hasOwnProperty.call(src, w)) dst[w] = (dst[w] || 0) + src[w];
+    }
+    return dst;
+  }
+
   function decodeText(buf) {
     var u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
     var encoding = 'utf-8';
@@ -234,6 +243,7 @@
     var hitChars = 0;
     var totalChars = 0;
     var matched = [];
+    var counts = {};   // v4.85：逐词命中处数（与检查软件报告的「内部(2)」同口径）
     var firstHit = false, lastHit = false;
     var out = lines.map(function (line, i) {
       var r = engine.apply(line, i === firstIdx, i === lastIdx);
@@ -247,6 +257,7 @@
       r.matched.forEach(function (m) {
         if (matched.indexOf(m) === -1) matched.push(m);
       });
+      mergeCounts(counts, r.counts);
       return r.text;
     });
 
@@ -260,6 +271,7 @@
       totalChars: totalChars,
       ratio: totalChars > 0 ? hitChars / totalChars : 0,
       matched: matched,
+      counts: counts,
       touched: hits > 0,
       encoding: encoding,
       firstHit: firstHit,
@@ -298,6 +310,7 @@
 
     var hits = 0;
     var matched = [];
+    var counts = {};   // v4.85：逐词命中处数
     var firstHit = false, lastHit = false;
     var outMarks = marks ? new Array(lines.length) : null;
     var out = lines.map(function (line, i) {
@@ -314,6 +327,7 @@
       r.matched.forEach(function (m) {
         if (matched.indexOf(m) === -1) matched.push(m);
       });
+      mergeCounts(counts, r.counts);
       return r.text;
     });
 
@@ -321,6 +335,7 @@
       text: out.join('\n'),
       hits: hits,
       matched: matched,
+      counts: counts,
       touched: hits > 0,
       firstHit: firstHit,
       lastHit: lastHit,
@@ -336,6 +351,9 @@
     res.matched.forEach(function (m) {
       if (counter.matched.indexOf(m) === -1) counter.matched.push(m);
     });
+    // v4.85：逐词命中处数跟着一起并进计数表
+    if (!counter.counts) counter.counts = {};
+    mergeCounts(counter.counts, res.counts);
     if (res.hits > 0) {
       if (res.atFirst) counter.firstHit = true;
       if (res.atLast) counter.lastHit = true;
@@ -522,6 +540,55 @@
     return out;
   }
 
+  /**
+   * XML 注释与 CDATA 里的内容。
+   *
+   * 为什么必须单独处理：注释既不是「标签之间的文本节点」（`>…<` 取不到，
+   * 因为注释尾巴的 `-->` 与下一个标签之间没有内容），也不在任何段落块里。
+   * 于是这类文件会出现最危险的一种假结论——扫描报「干净」、清除也不动，
+   * 但外部保密检查软件把包解开按全文一搜，词就在注释里，照样报出来。
+   *
+   * 注释属于隐藏内容，没有「首行 / 尾行」语义，按整部件口径处理（与属性值一致）。
+   * CDATA 同理：`<![CDATA[…]]>` 是 XML 的字面量文本，内容不参与实体解码，
+   * 也不在普通文本节点口径里，必须单独取出并连同 CDATA 包装一起改写。
+   */
+  function replaceHiddenXmlText(xml, engine, counter) {
+    if (xml.indexOf('<!') === -1) return xml;
+    var out = xml;
+    var cm = /<!--([\s\S]*?)-->/g;
+    var cmt;
+    while ((cmt = cm.exec(out)) !== null) {
+      var raw = cmt[1];
+      if (!raw) continue;
+      // 注释里可能用实体转义写词（&amp; / &#x673A;）：扫描侧按解码后的文本检索，
+      // 清除侧也必须按解码后的文本匹配，再把结果转义写回，否则会出现
+      // 「扫描报得出、清不掉」的口径分裂
+      var inner = decodeXml(raw);
+      var res = engine.apply(inner, true, true);
+      if (!res || res.text === inner) continue;
+      mergeMatch(counter, res);
+      if (counter) counter.totalChars += inner.replace(/\s/g, '').length;
+      var rewritten = '<!--' + encodeXml(res.text) + '-->';
+      out = out.slice(0, cmt.index) + rewritten + out.slice(cmt.index + cmt[0].length);
+      cm.lastIndex = cmt.index + rewritten.length;
+    }
+    var dm = /<!\[CDATA\[([\s\S]*?)\]\]>/g;
+    var dc;
+    while ((dc = dm.exec(out)) !== null) {
+      var body = dc[1];
+      if (!body) continue;
+      var dres = engine.apply(body, true, true);
+      if (!dres || dres.text === body) continue;
+      mergeMatch(counter, dres);
+      if (counter) counter.totalChars += body.replace(/\s/g, '').length;
+      // CDATA 里不能再放实体转义，直接写裸文本；换行保持原样
+      var dcNew = '<![CDATA[' + dres.text + ']]>';
+      out = out.slice(0, dc.index) + dcNew + out.slice(dc.index + dc[0].length);
+      dm.lastIndex = dc.index + dcNew.length;
+    }
+    return out;
+  }
+
   /** 属性值（如 xlsx 工作表名）；首/尾以「首个/最后一个非空属性值」为准。 */
   function replaceAttrs(xml, engine, counter, full) {
     if (xml.indexOf('="') === -1) return xml;
@@ -573,6 +640,13 @@
    *  以及 xlsx 批注（comment/t）。 */
   function specFor(name) {
     var n = String(name).toLowerCase();
+    // altChunk 外嵌内容（Word / WPS「插入为 HTML 片段」）：
+    // 包里会多出一个 word/afchunk.htm 之类的部件，正文用 <w:altChunk r:id="…"/> 引用它。
+    // 这个 HTML 不在 <w:p> 块口径里，外部保密检查软件解包后按全文检索却读得到——
+    // 不处理就会出现「扫描报干净、清除后仍被检出」。按整部件口径处理。
+    if (/^word\/.*\.(?:htm|html)$/.test(n)) {
+      return { textnodes: true, attrs: true, full: true };
+    }
     if (!/\.(xml|rels)$/.test(n)) return null;
     // .rels 的 Target / Type 是结构引用：改写会让文档打不开（关系找不到目标），
     // 而「报了命中却清不掉」更容易误导用户，因此 .rels 一律不处理、不统计
@@ -940,6 +1014,8 @@
     // 属性值（形状名、替换文字、书签名、域指令等）同样属于元数据，一律不跟随用户选择的首尾范围
     if (spec.textnodes) out = replaceTextNodes(out, engine, counter, spec.full);
     if (spec.attrs) out = replaceAttrs(out, engine, counter, spec.full || spec.attrsFull);
+    // 注释 / CDATA：既不在段落块里、也不在文本节点口径里，必须单独清理
+    out = replaceHiddenXmlText(out, engine, counter);
     if (levels) out = unmaskNestedWord(out);
     return out;
   }
@@ -1329,7 +1405,7 @@
       });
 
       return Promise.all(tasks).then(function () {
-        return { hits: counter.hits, hitChars: counter.hitChars, totalChars: counter.totalChars, ratio: counter.totalChars > 0 ? counter.hitChars / counter.totalChars : 0, matched: counter.matched, parts: counter.parts, firstHit: !!counter.firstHit, lastHit: !!counter.lastHit, vba: !!counter.hasVba, thumb: !!counter.hasThumb };
+        return { hits: counter.hits, hitChars: counter.hitChars, totalChars: counter.totalChars, ratio: counter.totalChars > 0 ? counter.hitChars / counter.totalChars : 0, matched: counter.matched, counts: counter.counts || {}, parts: counter.parts, firstHit: !!counter.firstHit, lastHit: !!counter.lastHit, vba: !!counter.hasVba, thumb: !!counter.hasThumb };
       });
     });
   }
@@ -1691,9 +1767,12 @@
     return [{ kind: 'bin', text: new TextDecoder('utf-8').decode(bytes) }];
   }
 
-  function addVerifyHit(res, label, hits, matched) {
+  function addVerifyHit(res, label, hits, matched, counts) {
     res.hits += hits;
     matched.forEach(function (m) { if (res.matched.indexOf(m) < 0) res.matched.push(m); });
+    // v4.85：逐词处数一并累计（与 mergeMatch 同一口径）
+    if (!res.counts) res.counts = {};
+    mergeCounts(res.counts, counts);
     var p = null;
     for (var i = 0; i < res.parts.length; i++) {
       if (res.parts[i].name === label) { p = res.parts[i]; break; }
@@ -1740,13 +1819,15 @@
       var r;
       try { r = engine.scan(v.text, true, true); } catch (e) { return; }
       if (!r || !r.hits) return;
-      addVerifyHit(res, label + (VIEW_KIND_LABEL[v.kind] || ''), r.hits, r.matched || []);
+      addVerifyHit(res, label + (VIEW_KIND_LABEL[v.kind] || ''), r.hits, r.matched || [], r.counts);
     });
   }
 
   function mergeVerify(dst, src) {
     dst.scanned += src.scanned;
-    src.parts.forEach(function (p) { addVerifyHit(dst, p.name, p.hits, p.matched); });
+    if (!dst.counts) dst.counts = {};
+    mergeCounts(dst.counts, src.counts);
+    src.parts.forEach(function (p) { addVerifyHit(dst, p.name, p.hits, p.matched, p.counts); });
   }
 
   /**
@@ -1802,7 +1883,7 @@
     if (bytes[0] === 0x50 && bytes[1] === 0x4b) {
       var ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
       return verifyOffice(ab, engine).then(function (r) {
-        return { hits: r.hits, matched: r.matched, parts: r.parts };
+        return { hits: r.hits, matched: r.matched, counts: r.counts || {}, parts: r.parts };
       });
     }
     return Promise.resolve().then(function () {
@@ -1861,11 +1942,61 @@
     if (!r || !r.hits) return res;
     res.hits = r.hits;
     res.matched = (r.matched || []).slice();
+    res.counts = r.counts || {};   // v4.85：文件名的逐词处数
     res.hitChars = r.hitChars || 0;
     res.totalChars = base.replace(/\s/g, '').length;
     res.parts = [{ name: base, label: '文件名', hits: r.hits, matched: (r.matched || []).slice() }];
     return res;
   }
+
+  /* ---------------- 图片提取（供 OCR 文字检查用） ---------------- */
+
+  var IMAGE_EXT_RE = /\.(png|jpe?g|bmp|gif|tiff?|webp)$/i;
+  var IMAGE_MIME = {
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', bmp: 'image/bmp',
+    gif: 'image/gif', tif: 'image/tiff', tiff: 'image/tiff', webp: 'image/webp'
+  };
+  var MAX_OCR_IMAGES = 12;   // 单个文件最多取 12 张图去识别，避免大文档卡死
+
+  /** 独立图片文件：正文层没有文字，只有 OCR 才看得见 */
+  function isImageFile(name) {
+    return IMAGE_EXT_RE.test(String(name || ''));
+  }
+
+  /**
+   * 从 OOXML / ZIP 里取出图片部件。
+   * 正文里的截图、图表、扫描件插页都走这里——这些图的文字正文层里没有，
+   * 只有 OCR 才看得见。
+   * @param {string} name 文件名
+   * @param {Uint8Array} bytes 文件内容
+   * @returns {Promise<Array<{part:string, bytes:Uint8Array, mime:string}>>}
+   */
+  function extractImages(name, bytes) {
+    if (!bytes || bytes.length < 4) return Promise.resolve([]);
+    if (!(bytes[0] === 0x50 && bytes[1] === 0x4b)) return Promise.resolve([]);
+    var ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    return Zip.load(ab).then(function (zip) {
+      var picked = [];
+      zip.entries.forEach(function (e) {
+        if (picked.length >= MAX_OCR_IMAGES) return;
+        if (!IMAGE_EXT_RE.test(e.name)) return;
+        var ext = (e.name.split('.').pop() || '').toLowerCase();
+        picked.push({ part: e.name, mime: IMAGE_MIME[ext] || 'image/png' });
+      });
+      if (!picked.length) return [];
+      return Promise.all(picked.map(function (p) {
+        return zip.getBytes(p.part).then(function (b) {
+          if (!b || !b.length) return null;
+          return { part: p.part, bytes: b, mime: p.mime };
+        }, function () { return null; });
+      })).then(function (list) {
+        return list.filter(Boolean);
+      });
+    }, function () {
+      return [];   // 解不开的包不拖累主流程
+    });
+  }
+
   global.DWRDoc = {
     TEXT_EXT: TEXT_EXT,
     WORD_EXT: WORD_EXT,
@@ -1902,6 +2033,8 @@
     verifyBytes: verifyBytes,
     scanBytes: scanBytes,
     scanFileName: scanFileName,
+    extractImages: extractImages,
+    isImageFile: isImageFile,
     extractText: extractText,
     extractPreview: extractPreview,
     encodeXml: encodeXml,

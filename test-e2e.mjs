@@ -222,7 +222,7 @@ async function auditScrolledHeader(page, theme) {
   if (!migratedHeads.includes('密级标识（4）')
       || migratedWords.some((text) => text.trim().startsWith('涉密'))
       || migratedTierWords.some((text) => text.indexOf('排除 前：商业') >= 0)
-      || storedSettings.settingsVersion !== 3
+      || storedSettings.settingsVersion !== 4
       || storedSettings.rules.some((r) => r.group === '密级标识'
         && r.notBefore && r.notBefore.indexOf('商业') >= 0)) {
     throw new Error('旧词库刷新迁移失败: ' + JSON.stringify({ migratedHeads, migratedWords, storedSettings }));

@@ -96,8 +96,13 @@
             <select id="scanExtPreset" data-tip="主流格式：docx / xlsx / pptx / pdf / txt / md 等常用文档；全部支持格式：含源码与配置，慢但最全；自定义：按右边填的扩展名扫" aria-label="文件格式筛选">
               <option value="common">主流格式（推荐）</option>
               <option value="all">全部支持格式</option>
+              <option value="cats">按类别多选…</option>
               <option value="custom">自定义</option>
             </select>
+          </div>
+          <div class="field" id="scanCatWrap" hidden>
+            <label data-tip="按类别勾选要扫的文件类型（可多选），对应外部保密检查系统的「检查文件类型」多选">文件类别（多选）</label>
+            <div class="chips cat-picker" id="scanCatBox" role="group" aria-label="文件类别多选"></div>
           </div>
           <div class="field" id="scanExtCustomWrap" style="display:none;">
             <label data-tip="用逗号分隔，可带点也可不带；如 docx, xlsx, txt">自定义扩展名</label>
@@ -114,6 +119,25 @@
               <option value="and">全部包含</option>
             </select>
           </div>
+          <div class="field">
+            <label data-tip="文件名与正文的关系，对应外部保密检查系统的「文件名内容关系」">文件名与内容关系</label>
+            <select id="scanNameRel" data-tip="或：文件名命中或正文命中都算命中；与：文件名命中且正文也命中才算命中，只有文件名中招的不计命中（会记入未检查清单）" aria-label="文件名与内容关系">
+              <option value="or">或（任一命中即可）</option>
+              <option value="and">与（两者都要命中）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label data-tip="这台电脑的定密级。文件判定的密级高于本机即为「越级存储」，会在结果表标红">本机定密级</label>
+            <select id="scanMachineLevel" data-tip="选「未定」则不判定越级。定了密级后，文件密级高于本机的会在表格里标「越级」，可一键筛出" aria-label="本机定密级">
+              <option value="">未定（不判定越级）</option>
+              <option value="公开">公开</option>
+              <option value="内部">内部</option>
+              <option value="秘密">秘密</option>
+              <option value="机密">机密</option>
+              <option value="绝密">绝密</option>
+            </select>
+          </div>
+          <label class="switch" data-tip="对文档里的插图、截图和扫描件做本地 OCR，把图上的字也纳入检索。识别模型随工具分发，不联网，但会明显变慢"><input type="checkbox" id="scanOcr"> 图片文字检查（OCR，较慢）</label>
           <button type="button" class="mini" id="clearDirMemBtn" data-tip="清除已记住的扫描、磁盘和保存目录">清除目录记忆</button>
           <div class="btn-row" style="margin-top:8px;">
             <button type="button" class="mini" id="importReportBtn" data-tip="支持 HTML、JSON 或 TXT 清单；导入后会按当前词库复查">导入报告…</button>
@@ -278,11 +302,13 @@
         <button type="button" class="ghost" id="reportBtn" disabled data-tip="导出本次处理记录，可用 Excel 打开">导出记录</button>
         <input type="text" id="reviewNote" placeholder="复核意见（可留空）" data-tip="人工复核结论，如「已复核，可外发」；会写进导出的报告，机器判定之外留一个签字的地方" aria-label="复核意见">
         <button type="button" class="ghost" id="reportHtmlBtn" disabled data-tip="导出一张 A4 单页报告，可用浏览器打印成 PDF（给合规 / 审计）">导出 HTML</button>
+        <button type="button" class="ghost" id="reportDocxBtn" disabled data-tip="导出 Word 版报告（.docx），可直接在 Word 里改、盖章、存档">导出 Word</button>
         <div class="more" id="moreWrap">
           <button type="button" class="ghost" id="moreBtn" data-tip="添加多个位置、导出 JSON 等次要操作" aria-expanded="false">更多 ▾</button>
           <div class="more-pop" id="morePop" hidden>
             <button type="button" class="ghost" id="addDrivesBtn" data-tip="一次挑多个盘 / 目录，把里面的文档一起加入处理列表">添加多个位置…</button>
             <button type="button" class="ghost" id="reportJsonBtn" disabled data-tip="导出本次处理记录（JSON）">导出 JSON</button>
+            <button type="button" class="ghost" id="reportXmlBtn" disabled data-tip="导出 XML 版处理记录（.xml），外部保密检查系统、整改台账可直接读取">导出 XML</button>
           </div>
         </div>
         <button type="button" class="primary" id="runBtn" disabled data-tip="请先添加文件；添加后可先检查，再清除并导出">清除并导出</button>
@@ -350,10 +376,14 @@
             <div class="more-pop" id="scanMorePop" hidden>
               <button type="button" class="ghost" id="scanSelInvert" data-tip="已选的取消，未选的选上">反选</button>
               <button type="button" class="ghost" id="scanDelSelBtn" disabled data-tip="只从结果中移除，不会删除磁盘文件">移出结果</button>
+              <button type="button" class="ghost" id="scanSkipSelBtn" disabled data-tip="把选中的文件标记为「本次跳过」：这一轮不处理、不删除，但仍保留在结果表与报告里">跳过选中</button>
+              <button type="button" class="ghost" id="scanSkipResetBtn" disabled data-tip="取消所有「本次跳过」标记，恢复为可参与处理">恢复全部跳过</button>
               <button type="button" class="ghost" id="scanRescreenBtn" disabled data-tip="改过词库或作用范围后，按新词库重新甄别已定位的报告文件">重新甄别</button>
               <button type="button" class="ghost" id="scanVerifyBtn" disabled data-tip="只检查所选文件是否仍有敏感词，不会修改文件">检查残留</button>
               <button type="button" class="ghost" id="scanReportBtn" disabled data-tip="导出本次命中清单，可用 Excel 打开">导出命中清单</button>
               <button type="button" class="ghost" id="scanReportHtmlBtn" disabled data-tip="导出一张 A4 单页报告，可用浏览器打印成 PDF（给合规 / 审计）">导出 HTML</button>
+              <button type="button" class="ghost" id="scanReportDocxBtn" disabled data-tip="导出 Word 版报告（.docx），可直接在 Word 里改、盖章、存档">导出 Word</button>
+              <button type="button" class="ghost" id="scanReportXmlBtn" disabled data-tip="导出 XML 版报告（.xml），外部保密检查系统、整改台账可直接读取">导出 XML</button>
               <button type="button" class="ghost" id="scanReportJsonBtn" disabled data-tip="导出本次命中清单（JSON）">导出 JSON</button>
               <button type="button" class="ghost" id="closeScanCard" data-tip="收起扫描结果表，结果仍保留">关闭</button>
             </div>
@@ -379,10 +409,17 @@
             <option value="hit">仅看命中</option>
             <option value="fp">仅看误报</option>
             <option value="unchecked">未检查</option>
+            <option value="gap">仅看漏检</option>
+            <option value="over">仅看越级</option>
+            <option value="secret">标密文件（判定了密级）</option>
+            <option value="public">判定的公开文件</option>
+            <option value="skipped">本次跳过（这一轮不动）</option>
           </select>
           <select id="scanSort" aria-label="扫描结果排序方式" data-tip="排序方式">
             <option value="default">默认顺序</option>
             <option value="hits">命中多→少</option>
+            <option value="ratio">命中占比 高→低</option>
+            <option value="level">涉密程度 高→低</option>
             <option value="size">大小↓</option>
             <option value="path">路径 A→Z</option>
           </select>
@@ -400,6 +437,7 @@
                 <th scope="col" class="sel-col" data-tip="全选 / 取消全选下方所有命中行"><input type="checkbox" id="scanSelAllBox" data-tip="全选 / 取消全选" aria-label="全选 / 取消全选"></th>
                 <th scope="col" style="width:42%" data-tip="文件在磁盘上的完整路径">路径</th>
                 <th scope="col" data-tip="文档格式">类型</th>
+                <th scope="col" data-tip="按命中词判定的文件密级；高于「本机定密级」即越级存储">密级</th>
                 <th scope="col" data-tip="命中字数占全文有效字数的比例，回答这份文件有多涉密">占比</th>
                 <th scope="col" data-tip="扫描发现的敏感词处数">命中</th>
                 <th scope="col" data-tip="命中的具体词语；点其中一个词可选中所有命中它的行">命中词</th>
@@ -489,6 +527,12 @@
   <script src="js/dircache.js"></script>
   <script src="js/undo.js"></script>
   <script src="js/reporthtml.js"></script>
+  <script src="js/reportdocx.js"></script>
+  <script src="js/reportxml.js"></script>
+  <script src="js/ocr.js"></script>
+  <!-- v4.95：OCR 结果可信度判定。认错了（中文被认成拉丁字母）不等于图上干净，
+       必须在 app.js 之前挂上 window.DWROcrSuspect，app.js 扫描时才会用它判「不可靠」。 -->
+  <script src="js/ocrsuspect.js"></script>
   <script src="js/app.js"></script>
 </body>
 

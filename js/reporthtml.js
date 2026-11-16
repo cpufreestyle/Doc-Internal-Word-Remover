@@ -53,7 +53,10 @@
       error: ['t-err', '失败'],
       pending: ['t-mute', '未处理'],
       clean: ['t-mute', '无命中'],
-      detect: ['t-hit', '仅检测']
+      detect: ['t-hit', '仅检测'],
+      // v4.94：本次跳过——复核人判定这一轮不动。报告里要留痕，
+      //   让人看出「这个文件看过了、决定不动」，而不是漏查。
+      skipped: ['t-mute', '已跳过']
     };
     var m = map[status] || ['t-mute', String(status || '-')];
     return '<span class="tag ' + m[0] + '">' + esc(m[1]) + '</span>';
@@ -171,5 +174,7 @@
     return h.join('\n');
   }
 
-  root.DWRReportHtml = { build: build };
+    // v4.94：导出 statusTag，便于回归测试直接断言状态口径
+    //   （新增「已跳过」这一档时，不必靠整份报告反推文案）。
+    root.DWRReportHtml = { build: build, statusTag: statusTag };
 })(typeof window !== 'undefined' ? window : globalThis);

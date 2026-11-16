@@ -10,9 +10,16 @@ A local-first desktop web app and command-line tool for scanning and removing se
 - Match the first line, last line, or the full document.
 - Delete, mask, or replace matched terms.
 - Process OOXML content including headers, comments, tracked changes, metadata, chart caches, and embedded Office files.
-- Preview matches, verify cleaned output, and export JSON, CSV, or HTML reports.
+- Preview matches, verify cleaned output, and export JSON, CSV, HTML, Word (.docx), or XML (.xml) reports.
 - Review large result sets with filters, range selection, false-positive controls, and a manual review checklist.
 - Import JSON reports, HTML tables from generic checking tools, or plain path lists.
+- When importing a report from an external confidentiality checking system, every conclusion it
+  already computed is kept as-is: creation time, modification time, file category, hit ratio,
+  classification level, and verdict. They sit next to this tool's own verdict so the two can be
+  compared line by line.
+- "Skip this round" marks a file as reviewed-but-untouched. Such rows take part in no bulk
+  action (clean, delete, add to list) but do **not** disappear — they stay in the result table and
+  the report, tagged "skipped", as a record of the review decision.
 
 ## Quick start
 
@@ -78,7 +85,7 @@ External confidentiality checkers search the file name plus the full unpacked pa
 - **File names count as hits**: a file named `Secret contract.docx` is reported even when its body is clean. The location is shown as "file name" and only the name is tested, never the directory.
 - **Both UTF-16 byte alignments are inspected** for legacy `doc` / `xls` / `ppt`: text in an OLE2 container is UTF-16 but not guaranteed to start on an even byte, so half of a file can be unreadable otherwise. Such hits are labelled "OLE misaligned".
 - **Namespace-prefixed OOXML is readable**: some online tools export sheets as `<x:c><x:v>`. Block patterns written for unprefixed tags match nothing and the whole part is silently skipped; a text-node fallback now covers it in scan, clean, and preview alike.
-- **PDF text is read**: built-in DEFLATE decompression plus `/ToUnicode` glyph mapping cover compressed content streams and text inside form XObjects (headers and watermarks often live there). Whitespace between CJK characters is collapsed, so justified headings such as `内 部` still match. Pages packed into `/ObjStm` object streams are expanded, and permission-only encryption with an empty user password (RC4 / AES-128) is decrypted through the standard security handler. Image-only (scanned) PDFs are explicitly tagged "scanned" and counted separately in the summary — no OCR, no guessing, manual review required. Scanned PDFs with zero hits still appear in the unchecked list and in a dedicated "scanned PDF" section of the HTML index, so they never disappear just because no word matched; damaged files and AES-256 PDFs fall back to "file name only", and the location column always says why.
+- **PDF text is read**: built-in DEFLATE decompression plus `/ToUnicode` glyph mapping cover compressed content streams and text inside form XObjects (headers and watermarks often live there). Whitespace between CJK characters is collapsed, so justified headings such as `内 部` still match. Pages packed into `/ObjStm` object streams are expanded, and permission-only encryption with an empty user password (RC4 / AES-128) is decrypted through the standard security handler. Image-only (scanned) PDFs are explicitly tagged "scanned" and counted separately in the summary — by default nothing is guessed and manual review is required; enable "image text check (OCR)" to have the bundled offline model read the picture and match its words too. Scanned PDFs with zero hits still appear in the unchecked list and in a dedicated "scanned PDF" section of the HTML index, so they never disappear just because no word matched; damaged files and AES-256 PDFs fall back to "file name only", and the location column always says why.
 - **Archives are unpacked**: `zip`, `jar`, and `apk` are inspected entry by entry, documents inside are parsed by their own format, entry names count as hits, and locations carry the in-package path. `rar` and `7z` have no decoder here, so only their file names are checked and the report says so.
 - **Document numbers require a bracketed year**: only the full form such as `Guofa [2023] No. 5` counts. Matching the bare prefix would delete ordinary words mid-sentence. Words passed explicitly through `--words` keep plain matching.
 - The post-clean self-check also re-tests the output file name and asks for a rename when it still contains a marker (renaming is left to the user because links and references would break).

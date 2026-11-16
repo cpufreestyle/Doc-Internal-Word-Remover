@@ -210,6 +210,86 @@ try {
     /--bind 127\.0\.0\.1/.test(sh) && /tcp:\/\/127\.0\.0\.1/.test(sh));
   check('startup-no-python2-fallback',
     !/SimpleHTTPServer/.test(sh) && !/start "" python -m http\.server/.test(bat));
+/* ---------------- v4.90 权限受限目录：不能当成「越界」，也不能当成「不存在」 ----------------
+   外部检查软件的报告里混着 WindowsApps / Program Files 这类系统目录很常见，
+   这些路径存在但当前账号无权解析真实路径（realpath 抛 EACCES / EPERM）。
+   以前的处理是整批报错：一份报告里混进一条系统目录，整批文件就都处理不了。
+   现在把「查不到真实路径」单独归类为无法验证，跳过并在日志里提示。
+   这里用 vm 跑 scan.mjs 里的真实函数锁住四种分支：
+   EPERM → 无法验证；ENOENT → 往上一级找已存在的祖先；全都不存在 → 原样返回；
+   其它错误（如 EINVAL）→ 照旧抛出，不能被悄悄吞掉。 */
+{
+  const SCANSRC = fs.readFileSync(scan, 'utf8');
+
+  /** 从源码里截出一个函数（按大括号配平），放进 vm 里跑 */
+  function sliceFn(src, marker) {
+    const k = src.indexOf(marker);
+    if (k < 0) return null;
+    let depth = 0, end = -1;
+    for (let i = src.indexOf('{', k); i < src.length; i++) {
+      if (src.charAt(i) === '{') depth++;
+      else if (src.charAt(i) === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+    }
+    return end < 0 ? null : src.slice(k, end);
+  }
+
+  const fnMissing = sliceFn(SCANSRC, 'function isMissingPathError');
+  const fnCanon = sliceFn(SCANSRC, 'async function canonicalForCheck');
+  const symSrc = SCANSRC.slice(SCANSRC.indexOf('const UNVERIFIABLE'), SCANSRC.indexOf('\n', SCANSRC.indexOf('const UNVERIFIABLE')));
+  check('v490-scan.mjs 有 UNVERIFIABLE 标记与两个路径函数',
+    !!fnMissing && !!fnCanon && symSrc.indexOf('UNVERIFIABLE') >= 0);
+
+  if (fnMissing && fnCanon && symSrc) {
+    /** 造一个可控的 fsp.realpath：按路径表决定抛什么错 */
+    function makeCtx(behaviour) {
+      const fsp = {
+        realpath: async (p) => {
+          const r = behaviour(p);
+          if (r instanceof Error) throw r;
+          return r;
+        }
+      };
+      const ctx = { fsp, path, Symbol, String, Object, Array, Error, console };
+      ctx.global = ctx;
+      vm.createContext(ctx);
+      vm.runInContext(symSrc + '\n' + fnMissing + '\n' + fnCanon, ctx);
+      return ctx;
+    }
+
+    const eacces = Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    const einval = Object.assign(new Error('EINVAL'), { code: 'EINVAL' });
+
+    // ① 路径存在但无权限 → 标记为「无法验证」，不抛错
+    const c1 = makeCtx(() => eacces);
+    const r1 = await vm.runInContext('canonicalForCheck("C:\\\\Program Files\\\\WindowsApps\\\\x")', c1);
+    check('v490-权限受限路径被标记为无法验证（不是越界也不是不存在）',
+      typeof r1 === 'symbol', 'got=' + String(r1));
+
+    // ② 路径不存在 → 往上一级找已存在的祖先，行为不变
+    const c2 = makeCtx((p) => (p === 'C:\\a\\b\\c.txt' ? enoent : 'C:\\a\\b'));
+    const r2 = await vm.runInContext('canonicalForCheck("C:\\\\a\\\\b\\\\c.txt")', c2);
+    check('v490-不存在的路径仍按「最近存在祖先 + 剩余段」解析',
+      r2 === 'C:\\a\\b\\c.txt', 'got=' + String(r2));
+
+    // ③ 祖先也都不存在 → 原样返回绝对路径
+    const c3 = makeCtx(() => enoent);
+    const r3 = await vm.runInContext('canonicalForCheck("C:\\\\a\\\\b\\\\c.txt")', c3);
+    check('v490-整条路径都不存在时返回绝对路径本身',
+      r3 === 'C:\\a\\b\\c.txt', 'got=' + String(r3));
+
+    // ④ 其它错误照旧抛出，不能被悄悄吞掉
+    const c4 = makeCtx(() => einval);
+    let threw = false;
+    try {
+      await vm.runInContext('canonicalForCheck("C:\\\\x")', c4);
+    } catch (e) {
+      threw = true;
+    }
+    check('v490-非权限类错误照旧抛出', threw);
+  }
+}
+
 } finally {
   try { fs.rmSync(base, { recursive: true, force: true }); } catch (e) { /* test cleanup */ }
 }

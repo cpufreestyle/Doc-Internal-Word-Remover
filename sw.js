@@ -5,7 +5,10 @@
 /* v4.78：词库与处理方式改为默认收起的设置栏，收起时仍显示当前方案。升级缓存
    版本可让仍挂着旧 Service Worker 的页面在下次打开时清掉旧 HTML / CSS / JS；
    在线请求同时绕过浏览器 HTTP 缓存，避免继续显示旧界面。 */
-const CACHE = 'dwr-v6';
+// v4.95：本次新增 js/ocrsuspect.js（OCR 结果可信度判定），index.html 与 app.js
+// 也随之改动。升缓存版本让仍挂着旧 Service Worker 的页面在下次打开时清掉旧
+// HTML / CSS / JS，避免继续用没有「OCR 不可靠」提示的旧界面。
+const CACHE = 'dwr-v8';
 const ASSETS = [
   './index.html', './css/style.css',
   './js/zip.js', './js/rules.js', './js/pdf.js', './js/ooxml.js', './js/util.js', './js/worker.js', './js/report.js',
@@ -14,6 +17,16 @@ const ASSETS = [
     './js/app.js',
   './js/undo.js',
   './js/reporthtml.js',
+  // v4.91：Word 报告导出模块（.docx 生成）
+  './js/reportdocx.js',
+// v4.92：XML 报告导出模块（外部保密检查系统 / 整改台账可直接读取 .xml 报告）
+'./js/reportxml.js',
+  // v4.88：图片 OCR 模块。识别模型（assets/ocr，约 12MB）不预缓存，
+  // 按需加载后由下面的 fetch 处理器顺带落缓存，避免首屏就吃掉十几兆。
+  './js/ocr.js',
+  // v4.95：OCR 结果可信度判定（中文被认成拉丁字母时不能当「干净」）。
+  // 漏了它，断网时页面能开但「OCR 不可靠」提示永远不出现。
+  './js/ocrsuspect.js',
   './assets/app-icon.svg', './assets/app-icon.png', './manifest.json'
   ,
   // favicon：断网时浏览器仍会请求它，漏缓存则标签页图标丢失（v4.27 补）

@@ -1,6 +1,6 @@
 {
   "name": "doc-internal-word-remover",
-  "version": "4.83.0",
+  "version": "4.98.0",
   "private": true,
   "description": "文档敏感词清除工具：Word/Excel/PowerPoint 与文本文件的敏感词扫描、清除与报告解析（零运行时依赖）",
   "license": "MIT",
@@ -9,7 +9,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test-allparts.mjs && node test-roundtrip.mjs && node test-coverage.mjs && node test-concurrency.mjs && node test-report.mjs && node test-formats.mjs && node test-rules.mjs && node test-security.mjs && node test-app.mjs && node test-release-sync.mjs && node tools/check-public.mjs",
+    "test": "node test-revision-ocr.mjs && node test-allparts.mjs && node test-roundtrip.mjs && node test-coverage.mjs && node test-concurrency.mjs && node test-report.mjs && node test-v494.mjs && node test-formats.mjs && node test-rules.mjs && node test-security.mjs && node test-app.mjs && node test-ocr.mjs && node test-ocrsuspect.mjs && node test-ocr-cli.mjs && node test-docx.mjs && node test-hidden.mjs && node test-reportxml.mjs && node test-release-sync.mjs && node tools/check-public.mjs",
     "test:all": "npm test",
     "test:app": "node test-app.mjs",
     "test:concurrency": "node test-concurrency.mjs",
@@ -18,11 +18,23 @@
     "test:report": "node test-report.mjs",
     "test:roundtrip": "node test-roundtrip.mjs",
     "test:rules": "node test-rules.mjs",
+    "test:ocr": "node test-ocr.mjs",
+    "test:ocr-cli": "node test-ocr-cli.mjs",
+    "test:ocrsuspect": "node test-ocrsuspect.mjs",
+    "test:ocr-live": "node test-ocr-live.mjs",
+    "test:scanned-pdf-ocr": "node test-scanned-pdf-ocr-live.mjs",
+    "test:docx": "node test-docx.mjs",
+    "test:hidden": "node test-hidden.mjs",
+    "test:revision-ocr": "node test-revision-ocr.mjs",
     "test:security": "node test-security.mjs",
     "test:public": "node tools/check-public.mjs",
     "test:release-sync": "node test-release-sync.mjs",
     "test:parts": "node test-allparts.mjs",
     "test:e2e": "node test-e2e.mjs",
     "scan": "node scan.mjs"
+  },
+  "devDependencies": {
+    "tesseract.js": "^7.0.0",
+    "tesseract.js-core": "^6.1.2"
   }
 }
