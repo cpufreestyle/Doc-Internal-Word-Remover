@@ -39,10 +39,23 @@ function authHeaders(token, extra = {}) {
   return { Authorization: `token ${token}`, ...extra };
 }
 
-async function request(url, options = {}, label = 'API 请求', timeoutMs = 45000) {
+/**
+ * 按包体大小给上传类请求留足时间。
+ *
+ * 发布包从约 1MB 涨到约 10MB（随包分发的 OCR 识别模型），而 GitHub
+ * Actions 的 runner 在美西、目标在 Gitee，10MB 走一趟要四十多秒——
+ * 固定 45 秒的写死超时刚好卡在边上，表现为「上传 Gitee 附件…超时」。
+ * 按字节数给上限：每 MB 额外给 20 秒，最低 45 秒、封顶 10 分钟。
+ */
+function uploadTimeoutMs(byteLength) {
+  const mb = (Number(byteLength) || 0) / (1024 * 1024);
+  return Math.min(600000, Math.max(45000, Math.ceil(45000 + mb * 20000)));
+}
+
+async function request(url, options = {}, label = 'API 请求', timeoutMs = 45000, allowRetry = false) {
   let lastError;
   const method = String(options.method || 'GET').toUpperCase();
-  const canRetry = method === 'GET' || method === 'HEAD';
+  const canRetry = method === 'GET' || method === 'HEAD' || allowRetry;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       const response = await fetch(url, {
@@ -113,6 +126,10 @@ function findExpectedAsset(release, tag) {
 function normalizeBody(body) {
   return String(body || '').replace(/\r\n/g, '\n').trimEnd();
 }
+
+/** 上传类请求的超时上限：按包体大小给（每 MB 额外 20 秒），
+ *  供回归测试直接验证，避免以后又被改回写死的 45 秒。 */
+export { uploadTimeoutMs };
 
 export function compareReleaseTags(left, right) {
   const leftIsHistory = left.startsWith('history-');
@@ -186,18 +203,38 @@ async function uploadGithubAsset(owner, repo, token, release, name, buffer) {
       'X-GitHub-Api-Version': '2022-11-28',
     }),
     body: buffer,
-  }, `上传 GitHub 附件 ${name}`);
+  }, `上传 GitHub 附件 ${name}`, uploadTimeoutMs(buffer.length));
 }
 
 async function uploadGiteeAsset(owner, repo, token, release, name, buffer) {
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: 'application/zip' }), name);
   const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
-  await request(url, {
-    method: 'POST',
-    headers: authHeaders(token),
-    body: form,
-  }, `上传 Gitee 附件 ${name}`);
+  // FormData 是一次性的：重试时必须重新构造，否则第二次发的是空 body。
+  const post = () => {
+    const f = new FormData();
+    f.append('file', new Blob([buffer], { type: 'application/zip' }), name);
+    return request(url, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: f,
+    }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), true);
+  };
+  try {
+    await post();
+  } catch (error) {
+    // 超时不一定等于「没传上去」——也可能是传完了但响应没回来。
+    // 先查一次附件列表：已经在就别重传（避免出现同名重复附件）。
+    const releases = await listGiteeReleases(owner, repo, token);
+    const found = releases
+      .map((r) => findExpectedAsset(r, release.tag_name))
+      .find(Boolean);
+    if (found) {
+      log(`上传 Gitee 附件 ${name} 报超时，但附件已存在，按成功处理`);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function verifyAssetPair(tag, githubAsset, giteeAsset) {

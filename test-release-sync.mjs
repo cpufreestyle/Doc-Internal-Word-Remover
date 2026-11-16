@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { compareReleaseTags, synchronize } from './tools/release-sync.mjs';
+import { compareReleaseTags, synchronize, uploadTimeoutMs } from './tools/release-sync.mjs';
 
 function release(tag, body = 'michaelqiu 出品') {
   const assetName = `Doc-Internal-Word-Remover-${tag}.zip`;
@@ -98,4 +98,15 @@ assert.deepEqual(
   ['history-v2.9', 'history-v2.10', 'history-v4.9', 'history-v4.10', 'v4.78.1'],
 );
 
-console.log('release sync: 5/5 passed');
+// v4.98：发布包因随包分发 OCR 识别模型从约 1MB 涨到约 10MB，
+// 写死 45 秒的超时会卡在边上，表现为「上传 Gitee 附件…超时」。
+// 超时必须随包体大小增长。
+{
+  const MB = 1024 * 1024;
+  assert.ok(uploadTimeoutMs(1 * MB) >= 45000, '小包也应有 45 秒保底');
+  assert.ok(uploadTimeoutMs(10 * MB) > uploadTimeoutMs(1 * MB), '大包的超时必须更长');
+  assert.ok(uploadTimeoutMs(10 * MB) >= 200000, '10MB 的包超时至少 200 秒');
+  assert.ok(uploadTimeoutMs(1000 * MB) <= 600000, '超时要有上限，不能无限长');
+}
+
+console.log('release sync: 6/6 passed');

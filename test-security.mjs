@@ -240,6 +240,15 @@ try {
     !!fnMissing && !!fnCanon && symSrc.indexOf('UNVERIFIABLE') >= 0);
 
   if (fnMissing && fnCanon && symSrc) {
+    /* 这几条用例必须按运行平台拼路径：用硬编码的 "C:\\a\\b" 在 Linux 上
+       path.dirname 不认反斜杠，整条路径会被当成一个文件名，
+       「最近存在祖先 + 剩余段」的解析结果自然是错的——
+       这不是被测代码的缺陷，而是用例本身写死了 Windows 路径。
+       GitHub Actions 的 runner 是 Linux，此前 CI 一直红在这里。 */
+    const SEP = path.sep;
+    const BASE = SEP === '\\' ? 'C:' + SEP + 'a' + SEP + 'b' : SEP + 'a' + SEP + 'b';
+    const CHILD = BASE + SEP + 'c.txt';
+
     /** 造一个可控的 fsp.realpath：按路径表决定抛什么错 */
     function makeCtx(behaviour) {
       const fsp = {
@@ -262,27 +271,31 @@ try {
 
     // ① 路径存在但无权限 → 标记为「无法验证」，不抛错
     const c1 = makeCtx(() => eacces);
-    const r1 = await vm.runInContext('canonicalForCheck("C:\\\\Program Files\\\\WindowsApps\\\\x")', c1);
+    const r1 = await vm.runInContext(
+      'canonicalForCheck(' + JSON.stringify(BASE + SEP + 'x') + ')', c1);
     check('v490-权限受限路径被标记为无法验证（不是越界也不是不存在）',
       typeof r1 === 'symbol', 'got=' + String(r1));
 
     // ② 路径不存在 → 往上一级找已存在的祖先，行为不变
-    const c2 = makeCtx((p) => (p === 'C:\\a\\b\\c.txt' ? enoent : 'C:\\a\\b'));
-    const r2 = await vm.runInContext('canonicalForCheck("C:\\\\a\\\\b\\\\c.txt")', c2);
+    const c2 = makeCtx((p) => (p === CHILD ? enoent : BASE));
+    const r2 = await vm.runInContext(
+      'canonicalForCheck(' + JSON.stringify(CHILD) + ')', c2);
     check('v490-不存在的路径仍按「最近存在祖先 + 剩余段」解析',
-      r2 === 'C:\\a\\b\\c.txt', 'got=' + String(r2));
+      r2 === CHILD, 'got=' + String(r2) + ' 期望=' + CHILD);
 
     // ③ 祖先也都不存在 → 原样返回绝对路径
     const c3 = makeCtx(() => enoent);
-    const r3 = await vm.runInContext('canonicalForCheck("C:\\\\a\\\\b\\\\c.txt")', c3);
+    const r3 = await vm.runInContext(
+      'canonicalForCheck(' + JSON.stringify(CHILD) + ')', c3);
     check('v490-整条路径都不存在时返回绝对路径本身',
-      r3 === 'C:\\a\\b\\c.txt', 'got=' + String(r3));
+      r3 === path.resolve(CHILD), 'got=' + String(r3) + ' 期望=' + path.resolve(CHILD));
 
     // ④ 其它错误照旧抛出，不能被悄悄吞掉
     const c4 = makeCtx(() => einval);
     let threw = false;
     try {
-      await vm.runInContext('canonicalForCheck("C:\\\\x")', c4);
+      await vm.runInContext(
+        'canonicalForCheck(' + JSON.stringify(BASE + SEP + 'x') + ')', c4);
     } catch (e) {
       threw = true;
     }
