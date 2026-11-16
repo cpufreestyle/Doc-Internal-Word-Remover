@@ -11,6 +11,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--dry-run') options.dryRun = true;
+    else if (arg === '--update-body') options.updateBody = true;
     else if (arg === '--tag') {
       options.tag = argv[i + 1] || '';
       i += 1;
@@ -191,6 +192,26 @@ async function createGithubRelease(owner, repo, token, giteeRelease) {
   return readJson(response, `创建 GitHub Release ${giteeRelease.tag_name}`);
 }
 
+/** 更新已存在的 Gitee Release 的正文。
+ *  默认不同步工具发现两边正文不一致就会中止（避免覆盖人工编辑），
+ *  只有显式传 --update-body 时才会调这个函数把 Gitee 正文对齐 GitHub。 */
+async function updateGiteeReleaseBody(owner, repo, token, release, body, name) {
+  const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}`;
+  const payload = {
+    tag_name: release.tag_name,
+    name: release.name || release.tag_name,
+    body: body || '',
+    target_commitish: release.target_commitish || 'main',
+    prerelease: Boolean(release.prerelease),
+  };
+  const response = await request(url, {
+    method: 'PATCH',
+    headers: authHeaders(token, { 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }, `更新 Gitee Release 正文 ${release.tag_name}`);
+  return readJson(response, `更新 Gitee Release 正文 ${release.tag_name}`);
+}
+
 async function uploadGithubAsset(owner, repo, token, release, name, buffer) {
   const uploadUrl = new URL(release.upload_url.replace(/\{.*$/, ''));
   uploadUrl.searchParams.set('name', name);
@@ -206,7 +227,7 @@ async function uploadGithubAsset(owner, repo, token, release, name, buffer) {
   }, `上传 GitHub 附件 ${name}`, uploadTimeoutMs(buffer.length));
 }
 
-async function uploadGiteeAsset(owner, repo, token, release, name, buffer) {
+async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log) {
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: 'application/zip' }), name);
   const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
@@ -268,6 +289,7 @@ export async function synchronize({
   giteeToken,
   tag = '',
   dryRun = false,
+  updateBody = false,
   log = console.log,
 }) {
   const [githubReleases, giteeReleases] = await Promise.all([
@@ -312,6 +334,26 @@ export async function synchronize({
       changes += 1;
     }
 
+    // 正文不一致时默认中止（防止覆盖人工编辑）。
+    // 显式传 --update-body 才允许把 Gitee 正文对齐 GitHub——
+    // 典型场景：上一次发版中途失败，Gitee 上留下的是旧的自动生成正文，
+    // 而 GitHub 上已被新一轮发布更新过。
+    if (githubRelease && giteeRelease &&
+        normalizeBody(githubRelease.body) !== normalizeBody(giteeRelease.body)) {
+      if (!updateBody) {
+        throw new Error(`${currentTag} 的 Release 正文不一致；为避免覆盖人工修改，已停止自动同步`);
+      }
+      log(`对齐 Gitee Release 正文：${currentTag}`);
+      if (dryRun) {
+        // 只报告不写入：正文并没有真的对齐，跳过后面的正文一致性断言
+        changes += 1;
+        continue;
+      }
+      giteeRelease = await updateGiteeReleaseBody(
+        giteeOwner, giteeRepo, giteeToken, giteeRelease, githubRelease.body);
+      giteeByTag.set(currentTag, giteeRelease);
+      changes += 1;
+    }
     assertMatchingMetadata(currentTag, githubRelease, giteeRelease);
     let githubAsset = findExpectedAsset(githubRelease, currentTag);
     let giteeAsset = findExpectedAsset(giteeRelease, currentTag);
@@ -336,7 +378,7 @@ export async function synchronize({
         continue;
       }
       const buffer = await download(githubAsset.browser_download_url, `下载 GitHub 附件 ${currentTag}`);
-      await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer);
+      await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log);
       changes += 1;
     } else {
       log(`校验：${currentTag} 附件 SHA256`);
@@ -349,8 +391,10 @@ export async function synchronize({
 
 function usage() {
   return [
-    '用法：node tools/release-sync.mjs [--tag vX.Y.Z] [--dry-run]',
+    '用法：node tools/release-sync.mjs [--tag vX.Y.Z] [--dry-run] [--update-body]',
     '',
+    '  --update-body  两边正文不一致时，把 Gitee 正文对齐 GitHub。',
+    '                 默认不传：发现不一致就中止，避免覆盖人工编辑。',
     '环境变量：GITHUB_TOKEN、GITEE_TOKEN',
     '可选变量：GITHUB_OWNER、GITHUB_REPO、GITEE_OWNER、GITEE_REPO',
   ].join('\n');
@@ -370,6 +414,7 @@ async function main() {
     giteeToken: process.env.GITEE_TOKEN,
     tag: options.tag,
     dryRun: options.dryRun,
+    updateBody: Boolean(options.updateBody),
   });
   console.log(`完成：检查 ${result.checked} 个 Release，${result.dryRun ? '预计' : '实际'}变更 ${result.changes} 个。`);
 }

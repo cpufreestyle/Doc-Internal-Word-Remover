@@ -28,6 +28,12 @@ function mockFetch({ github, gitee, githubAsset = 'same', giteeAsset = 'same' })
       if (value === 'https://gitee.com/api/v5/repos/o/r/releases' && method === 'POST') {
         return Response.json({ ...release('v1.0.0'), id: 99, assets: [] }, { status: 201 });
       }
+      if (value.includes('/releases/') && method === 'PATCH') {
+        // 保留原有附件列表：更新正文不应影响附件
+        const existing = release('v1.0.0', 'github body');
+        existing.id = 49;
+        return Response.json(existing, { status: 200 });
+      }
       if (value.includes('/releases/99/attach_files') && method === 'POST') {
         return Response.json({ name: 'Doc-Internal-Word-Remover-v1.0.0.zip' }, { status: 201 });
       }
@@ -93,6 +99,30 @@ const common = {
   await assert.rejects(() => synchronize(common), /正文不一致/);
 }
 
+// v4.98：正文不一致时，默认必须中止（防覆盖人工修改）；
+//   显式传 updateBody 才允许把 Gitee 正文对齐 GitHub。
+//   典型场景：上一次发版中途失败，Gitee 上留下旧的自动生成正文，
+//   而 GitHub 上已被新一轮发布更新过。
+{
+  const a = release('v1.0.0', 'github body');
+  const b = release('v1.0.0', 'gitee body');
+  const fake = mockFetch({ github: [a], gitee: [b] });
+  globalThis.fetch = fake.fetch;
+  await assert.rejects(() => synchronize({ ...common, updateBody: false }), /正文不一致/);
+}
+{
+  const a = release('v1.0.0', 'github body');
+  const b = release('v1.0.0', 'gitee body');
+  const fake = mockFetch({ github: [a], gitee: [b] });
+  globalThis.fetch = fake.fetch;
+  // 显式授权后：应发出一次 PATCH 更新 Gitee 正文，且不再抛「正文不一致」
+  const result = await synchronize({ ...common, updateBody: true });
+  assert.equal(result.changes, 1);
+  const patch = fake.calls.find((c) => c.method === 'PATCH');
+  assert.ok(patch, '没有发出更新 Gitee 正文的 PATCH 请求');
+  assert.ok(patch.url.includes('/releases/'), 'PATCH 地址不对：' + patch.url);
+}
+
 assert.deepEqual(
   ['history-v4.10', 'v4.78.1', 'history-v2.10', 'history-v4.9', 'history-v2.9'].sort(compareReleaseTags),
   ['history-v2.9', 'history-v2.10', 'history-v4.9', 'history-v4.10', 'v4.78.1'],
@@ -109,4 +139,4 @@ assert.deepEqual(
   assert.ok(uploadTimeoutMs(1000 * MB) <= 600000, '超时要有上限，不能无限长');
 }
 
-console.log('release sync: 6/6 passed');
+console.log('release sync: 8/8 passed');

@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      update_body:
+        description: '两边正文不一致时，把 Gitee 正文对齐 GitHub（会覆盖 Gitee 上的人工修改，慎用）'
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: '17,47 * * * *'
 
@@ -37,6 +42,7 @@ jobs:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           SYNC_TAG: ${{ inputs.tag }}
           SYNC_DRY_RUN: ${{ inputs.dry_run }}
+          SYNC_UPDATE_BODY: ${{ inputs.update_body }}
         run: |
           args=()
           if [ -n "$SYNC_TAG" ]; then
@@ -44,5 +50,8 @@ jobs:
           fi
           if [ "$SYNC_DRY_RUN" = "true" ]; then
             args+=(--dry-run)
+          fi
+          if [ "$SYNC_UPDATE_BODY" = "true" ]; then
+            args+=(--update-body)
           fi
           node tools/release-sync.mjs "${args[@]}"
