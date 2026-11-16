@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { compareReleaseTags, synchronize, uploadTimeoutMs, buildMultipartBody } from './tools/release-sync.mjs';
+import http from 'node:http';
+import {
+  compareReleaseTags, synchronize, uploadTimeoutMs, buildMultipartBody, fetchTransport, httpsPostBuffer,
+} from './tools/release-sync.mjs';
 
 function release(tag, body = 'michaelqiu 出品') {
   const assetName = `Doc-Internal-Word-Remover-${tag}.zip`;
@@ -71,6 +74,9 @@ const common = {
   giteeRepo: 'r',
   githubToken: 'x',
   giteeToken: 'y',
+  // 线上默认走 node:https（fetch 有 5 分钟响应头限制）；测试里注入 fetch 通道，
+  // 这样下面的全局 fetch mock 仍然能接管上传请求。
+  giteeUploadTransport: fetchTransport,
   log: () => {},
 };
 
@@ -228,4 +234,42 @@ assert.deepEqual(
   await assert.rejects(() => synchronize({ ...common, retryDelayMs: 0 }), /ECONNRESET/);
 }
 
-console.log('release sync: 14/14 passed');
+// v4.98.1：Gitee 上传改走 node:https 直传。
+//   起因是 undici 的 fetch 有内部 headersTimeout=300s：服务端收完 10MB
+//   才回响应头，跨境上传正好卡在 5 分钟，于是每次都被中断。
+//   这里用本地真实 HTTP 服务验证这条通道：超大请求体 + 服务端延迟响应，
+//   仍然完整送达并拿到结果。
+{
+  const payload = Buffer.alloc(2 * 1024 * 1024, 0x42);
+  for (let i = 0; i < payload.length; i += 8192) payload[i] = i % 251;
+  const { body, contentType } = buildMultipartBody('file', 'big.zip', payload, 'application/zip');
+
+  let received = 0;
+  let declared = '';
+  const server = http.createServer((req, res) => {
+    declared = String(req.headers['content-length'] || '');
+    let n = 0;
+    req.on('data', (c) => { n += c.length; });
+    req.on('end', () => {
+      received = n;
+      // 模拟 Gitee：收完之后再想一会儿才回响应头
+      setTimeout(() => {
+        res.writeHead(201, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }, 300);
+    });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  const text = await httpsPostBuffer(`http://127.0.0.1:${port}/upload`, {
+    'Content-Type': contentType,
+    'Content-Length': String(body.length),
+  }, body, 60000);
+  server.close();
+
+  assert.equal(declared, String(body.length), 'Content-Length 与实际体长不一致');
+  assert.equal(received, body.length, '服务端没有收全');
+  assert.match(text, /"ok":true/, '没有拿到正常响应体');
+}
+
+console.log('release sync: 15/15 passed');

@@ -2,6 +2,8 @@
 
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import https from 'node:https';
+import http from 'node:http';
 
 const PER_PAGE = 100;
 const ZIP_PREFIX = 'Doc-Internal-Word-Remover-';
@@ -139,7 +141,7 @@ function normalizeBody(body) {
 
 /** 上传类请求的超时上限：按包体大小给（每 MB 额外 20 秒），
  *  供回归测试直接验证，避免以后又被改回写死的 45 秒。 */
-export { uploadTimeoutMs, buildMultipartBody };
+export { uploadTimeoutMs, buildMultipartBody, fetchTransport, httpsPostBuffer };
 
 export function compareReleaseTags(left, right) {
   const leftIsHistory = left.startsWith('history-');
@@ -259,17 +261,22 @@ function buildMultipartBody(fieldName, fileName, fileBuffer, contentType) {
   };
 }
 
-async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log, retryDelayMs = 15000) {
+async function uploadGiteeAsset(owner, repo, token, release, name, buffer, log = console.log,
+  retryDelayMs = 15000, transport = httpsPostBuffer) {
   const url = `https://gitee.com/api/v5/repos/${owner}/${repo}/releases/${release.id}/attach_files`;
   const { body, contentType } = buildMultipartBody('file', name, buffer, 'application/zip');
-  const post = () => request(url, {
-    method: 'POST',
-    headers: authHeaders(token, {
-      'Content-Type': contentType,
-      'Content-Length': String(body.length),
-    }),
-    body,
-  }, `上传 Gitee 附件 ${name}`, uploadTimeoutMs(buffer.length), false);
+  const headers = authHeaders(token, {
+    'Content-Type': contentType,
+    'Content-Length': String(body.length),
+  });
+  const label = `上传 Gitee 附件 ${name}`;
+  const post = async () => {
+    try {
+      return await transport(url, headers, body, uploadTimeoutMs(buffer.length), label);
+    } catch (e) {
+      throw new Error(`${label}失败：${e.message}`);
+    }
+  };
 
   // 跨境上传 10MB 实测会出现「跑到四五分钟连接被重置」的情况
   // （不是我们的超时，底层报 ECONNRESET / UND_ERR_SOCKET），而同一条链路
@@ -318,6 +325,71 @@ async function deleteGiteeAsset(owner, repo, token, release, asset) {
   }, `删除旧 Gitee 附件 ${asset.name}`);
 }
 
+/**
+ * 用 node:https 直传一段固定长度的请求体。
+ *
+ * 为什么不用 fetch：undici 的 fetch 有一个内部默认值 `headersTimeout = 300s`
+ * ——从请求发出到**收到响应头**超过 5 分钟就报 `UND_ERR_HEADERS_TIMEOUT`。
+ * Gitee 的 attach_files 要等服务端把 10MB 收完并落盘才回响应，跨境上传
+ * 正好卡在 5 分钟上下，于是每次都失败；这个值无法通过 fetch 参数调整。
+ * node:https 没有这个内部上限，只有我们自己设的超时：
+ *   - 停滞超时：连续 120 秒收不到任何数据才中断（慢但在走就继续）；
+ *   - 总时长上限：由调用方按包体大小给出。
+ */
+function httpsPostBuffer(url, headers, body, totalTimeoutMs) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    // 测试里用本地 http 服务验证这条通道；线上是 https。
+    const mod = u.protocol === 'http:' ? http : https;
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(totalTimer);
+      fn(arg);
+    };
+    const req = mod.request({
+      method: 'POST',
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      headers,
+    }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (c) => {
+        size += c.length;
+        if (size > 1024 * 1024) { req.destroy(new Error('响应体过大')); return; }
+        chunks.push(c);
+      });
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        const code = res.statusCode || 0;
+        if (code >= 200 && code < 300) finish(resolve, text);
+        else finish(reject, new Error(`HTTP ${code}：${text.slice(0, 300)}`));
+      });
+      res.on('error', (e) => finish(reject, e));
+    });
+    const totalTimer = setTimeout(() => {
+      req.destroy(new Error(`上传超过 ${Math.round(totalTimeoutMs / 1000)} 秒未完成`));
+    }, totalTimeoutMs);
+    // 停滞超时：socket 上连续 120 秒没有任何动静才判死
+    req.setTimeout(120000, () => {
+      req.destroy(new Error('上传停滞超过 120 秒（连续无数据）'));
+    });
+    req.on('error', (e) => finish(reject, e));
+    req.end(body);
+  });
+}
+
+/**
+ * 供测试注入的 fetch 版传输通道（单元测试里 mock 的是全局 fetch）。
+ * 线上默认走 httpsPostBuffer——fetch 的 5 分钟响应头限制对 Gitee 上传是硬伤。
+ */
+function fetchTransport(url, headers, body, timeoutMs, label) {
+  return request(url, { method: 'POST', headers, body }, label, timeoutMs, false);
+}
+
 async function verifyAssetPair(tag, githubAsset, giteeAsset) {
   const giteeBuffer = await download(giteeAsset.browser_download_url, `下载 Gitee 附件 ${tag}`);
   const giteeHash = sha256(giteeBuffer);
@@ -352,6 +424,7 @@ export async function synchronize({
   updateBody = false,
   replaceAsset = false,
   retryDelayMs = 15000,
+  giteeUploadTransport = httpsPostBuffer,
   log = console.log,
 }) {
   const [githubReleases, giteeReleases] = await Promise.all([
@@ -440,7 +513,7 @@ export async function synchronize({
         continue;
       }
       const buffer = await download(githubAsset.browser_download_url, `下载 GitHub 附件 ${currentTag}`);
-      await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log, retryDelayMs);
+      await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log, retryDelayMs, giteeUploadTransport);
       changes += 1;
     } else {
       log(`校验：${currentTag} 附件 SHA256`);
@@ -458,7 +531,7 @@ export async function synchronize({
         }
         const buffer = await download(githubAsset.browser_download_url, `下载 GitHub 附件 ${currentTag}`);
         await deleteGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, giteeAsset);
-        await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log, retryDelayMs);
+        await uploadGiteeAsset(giteeOwner, giteeRepo, giteeToken, giteeRelease, assetName, buffer, log, retryDelayMs, giteeUploadTransport);
         changes += 1;
       }
     }
