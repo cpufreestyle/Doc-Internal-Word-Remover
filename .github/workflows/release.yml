@@ -34,6 +34,11 @@ jobs:
           go install github.com/akavel/rsrc@latest
           "$(go env GOPATH)/bin/rsrc" -arch 386 -ico assets/app-icon.ico -manifest tools/launcher/app.manifest -o tools/launcher/rsrc_windows_386.syso
 
+      # 打包前必须先过测试：此前只有 push 到 main 才跑 CI，
+      # 理论上可以从一个测试没过的提交打 tag 并发布出去。
+      - name: Run tests before packaging
+        run: npm test
+
       - name: Package web app
         run: |
           VER="${GITHUB_REF_NAME}"

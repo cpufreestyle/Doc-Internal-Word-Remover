@@ -1,5 +1,31 @@
 # Changelog
 
+## v4.98.1 - 2026-11-16
+
+- **补上随包 OCR 资源的第三方许可声明**（本版核心）：
+  `assets/ocr` 里分发着 11MB 第三方文件，但压缩文件头部写着
+  「see tesseract.min.js.LICENSE.txt」，而那个文件**根本没有随包分发**——
+  指向一个不存在的许可文件，比不写更糟。现在补齐：
+  - `assets/ocr/tesseract.min.js.LICENSE.txt`、`worker.min.js.LICENSE.txt`
+    （打包进压缩文件的第三方片段的版权声明：regenerator-runtime、buffer、
+    ieee754、zlib.js）；
+  - `assets/ocr/LICENSE-tesseract.js.txt`、`LICENSE-tesseract.js-core.txt`
+    （Apache License 2.0 全文）；
+  - `assets/ocr/NOTICE.md`：逐项列出组件、版本、上游地址与许可，
+    并记录语言数据的来源与 SHA256。
+  语言数据经实测确认与 `tesseract-ocr/tessdata_fast` 主干逐字节一致
+  （`chi_sim` / `eng` 的原始文件哈希已写入 NOTICE）。
+- **回归测试补 3 条**（`test-app.mjs` 的 v4981 区块）：
+  ① 压缩文件里引用的 `*.LICENSE.txt` 必须真实存在于包内；
+  ② `assets/ocr/NOTICE.md` 必须写明 Apache 2.0 与上游；
+  ③ NOTICE 里记录的模型哈希必须与实物一致（换模型后声明过期会立刻变红）。
+  已做反向验证：临时挪走一个许可文件，门禁立即报红。
+- **发版前必须跑测试**：`release.yml` 在打包之前增加 `npm test` 一步。
+  此前只有 push 到 main 时才跑 CI，理论上可以从一个测试没过的提交打 tag
+  并发布出去——发出去的是坏包，代价比一次红灯高得多。
+- 文档：README 的「许可」一节补充第三方组件段落，指向上述声明文件。
+- `package.json` 版本号 `4.98.0` → `4.98.1`。
+
 ## v4.98.0 - 2026-11-16
 
 - **修掉发布链路里的一处真问题：CI 漏跑了一半的测试**（本版核心）。

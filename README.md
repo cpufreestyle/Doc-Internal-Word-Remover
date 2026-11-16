@@ -177,8 +177,21 @@ node test-e2e.mjs
 
 `npm test` 覆盖格式处理、规则匹配、报告解析、并发、界面逻辑和安全边界。Playwright 冒烟测试需要 Chromium。
 
-版本变更见 `CHANGELOG.md（21 条版本记录）`。
+版本变更见 `CHANGELOG.md（22 条版本记录）`。
 
 ## 许可
 
 MIT License。Copyright (c) 2026 cpufreestyle (michaelqiu)。
+
+### 第三方组件
+
+随包分发的 OCR 资源来自开源项目，原样收录、未做修改：
+
+- **tesseract.js / tesseract.js-core**（Apache License 2.0）——
+  `assets/ocr/` 下的识别脚本与 WASM 内核；
+- **Tesseract 语言数据**（Apache License 2.0，来自 `tesseract-ocr/tessdata_fast`）——
+  `assets/ocr/lang/` 下的中文 / 英文模型。
+
+完整的版权声明、上游地址与逐文件 SHA256 见 `assets/ocr/NOTICE.md`，
+许可全文见 `assets/ocr/LICENSE-tesseract.js.txt` 与
+`assets/ocr/LICENSE-tesseract.js-core.txt`。

@@ -568,6 +568,53 @@ const D = ctx.window;
       })(),
       'package.json 的 npm test 没有串入目录里的全部测试套件');
   }
+
+  // v4.98.1 第三方资源合规门禁：随包分发的 OCR 资源必须带齐许可与来源声明。
+  //   之前压缩文件头部写着「see tesseract.min.js.LICENSE.txt」，
+  //   但那个文件根本没随包分发——指向一个不存在的许可文件，比不写更糟。
+  {
+    const ocrDir = path.join(__dirname, 'assets', 'ocr');
+    const walk = (dir) => {
+      const out = [];
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) out.push(...walk(full));
+        else out.push(full);
+      }
+      return out;
+    };
+    const files = walk(ocrDir);
+
+    // ① 文件里引用的 *.LICENSE.txt 必须真实存在
+    const missing = [];
+    for (const f of files) {
+      if (!/\.js$/i.test(f)) continue;
+      const head = fs.readFileSync(f, 'utf8').slice(0, 400);
+      const ref = /see ([A-Za-z0-9_.-]+\.LICENSE\.txt)/.exec(head);
+      if (ref && !fs.existsSync(path.join(path.dirname(f), ref[1]))) {
+        missing.push(path.basename(f) + ' -> ' + ref[1]);
+      }
+    }
+    check('v4981-OCR 资源引用的许可文件都在包内', missing.length === 0, missing.join(', '));
+
+    // ② NOTICE 必须在场，且写明 Apache 2.0 与上游地址
+    const noticePath = path.join(ocrDir, 'NOTICE.md');
+    const notice = fs.existsSync(noticePath) ? fs.readFileSync(noticePath, 'utf8') : '';
+    check('v4981-OCR 资源有第三方声明',
+      /Apache License 2\.0/.test(notice) && /tesseract-ocr\/tessdata_fast/.test(notice),
+      'assets/ocr/NOTICE.md 缺失或没写明许可与上游');
+
+    // ③ NOTICE 里记录的哈希必须与实物一致（防止换模型后声明过期）
+    const crypto = await import('node:crypto');
+    const bad = [];
+    for (const name of ['chi_sim', 'eng']) {
+      const gz = path.join(ocrDir, 'lang', name + '.traineddata.gz');
+      if (!fs.existsSync(gz)) { bad.push(name + ': 文件缺失'); continue; }
+      const hash = crypto.createHash('sha256').update(fs.readFileSync(gz)).digest('hex');
+      if (!notice.includes(hash)) bad.push(name + ': NOTICE 哈希与实物不符');
+    }
+    check('v4981-NOTICE 里的模型哈希与实物一致', bad.length === 0, bad.join(', '));
+  }
   }
 
   // v4.61 undo.js 的 localStorage 写失败降级：隐私模式 / 配额超限时 setItem 抛错，
