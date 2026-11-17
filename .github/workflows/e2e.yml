@@ -19,7 +19,12 @@ permissions:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    # 必须钉死 runner 镜像，不能用 ubuntu-latest：
+    #   GitHub 已把 latest 换成 Ubuntu 26.04，而 playwright 只为它支持的平台
+    #   提供浏览器构建——在 26.04 上会直接报「does not support chromium on
+    #   ubuntu26.04-x64」，浏览器根本装不上。
+    #   用 latest 就等于把「能不能跑测试」押在平台漂移上。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

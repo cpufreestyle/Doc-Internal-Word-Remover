@@ -14,7 +14,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # 必须钉死 runner 镜像：发版流程要跑浏览器冒烟，而 playwright 只为它
+    # 支持的平台提供浏览器构建。ubuntu-latest 已换成 Ubuntu 26.04，
+    # 在那儿浏览器根本装不上（会直接让整次发版失败）。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

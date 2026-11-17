@@ -617,6 +617,14 @@ const D = ctx.window;
           /install --with-deps chromium/.test(RL3) && /\|\|\s*npx/.test(RL3)
             && /install --with-deps chromium/.test(E2EY) && /\|\|\s*npx/.test(E2EY),
           'release.yml / e2e.yml 里的浏览器安装缺少降级兜底');
+        // 要跑浏览器的 job 必须钉死 runner 镜像：ubuntu-latest 已换成
+        // Ubuntu 26.04，而 playwright 只为它支持的平台提供浏览器构建，
+        // 在 26.04 上会报「does not support chromium on ubuntu26.04-x64」，
+        // 浏览器根本装不上——整次发版会被打断。
+        check('v4982-跑浏览器的 job 钉死了 runner 镜像',
+          /runs-on:\s*ubuntu-24\.04/.test(RL3) && /runs-on:\s*ubuntu-24\.04/.test(E2EY)
+            && !/runs-on:\s*ubuntu-latest/.test(RL3) && !/runs-on:\s*ubuntu-latest/.test(E2EY),
+          'release.yml / e2e.yml 用了 ubuntu-latest，镜像一漂移浏览器就装不上');
         check('v4982-发版流程跑浏览器冒烟',
           RL3.indexOf('tools/run-e2e.mjs') >= 0,
           'release.yml 里没有调用浏览器冒烟');
