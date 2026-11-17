@@ -43,7 +43,11 @@ jobs:
         run: |
           PW_VER=$(node tools/run-e2e.mjs --print-version)
           echo "playwright@$PW_VER"
-          npx --yes "playwright@$PW_VER" install --with-deps chromium
+          # --with-deps 要装系统依赖，需要 sudo；某些新 runner 镜像上它会失败
+          # （如 ubuntu26.04 + 某些 playwright 版本会报「不支持该平台」）。
+          # 这时退一步只装浏览器本体——runner 镜像里通常已带齐运行库。
+          npx --yes "playwright@$PW_VER" install --with-deps chromium \
+            || npx --yes "playwright@$PW_VER" install chromium
           node tools/run-e2e.mjs
 
       - name: Embed icon into launcher

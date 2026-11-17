@@ -606,6 +606,17 @@ const D = ctx.window;
         check('v4982-playwright 版本只写在 package.json 一处',
           !!PW && !/playwright@[\d.]/.test(RS),
           'package.json 缺 playwright 版本，或脚本里又写死了一份');
+        // 必须精确锁定：写 ^1.48.0 会随 dependabot 自动升版本，
+        // 而新版本未必支持当前 runner 镜像（实测 1.55.1 在 ubuntu26.04 上
+        // 连浏览器都装不上，会把发版流程整段打断）。
+        check('v4982-playwright 版本是精确锁定（不带 ^ ~ 范围）',
+          !!PW && !/^[\^~>=<\s]/.test(String(PW)),
+          'package.json 里的 playwright 版本必须写死，不能用范围：' + PW);
+        // 浏览器安装要有降级：--with-deps 要 sudo，新 runner 镜像上可能失败。
+        check('v4982-浏览器安装带降级兜底',
+          /install --with-deps chromium/.test(RL3) && /\|\|\s*npx/.test(RL3)
+            && /install --with-deps chromium/.test(E2EY) && /\|\|\s*npx/.test(E2EY),
+          'release.yml / e2e.yml 里的浏览器安装缺少降级兜底');
         check('v4982-发版流程跑浏览器冒烟',
           RL3.indexOf('tools/run-e2e.mjs') >= 0,
           'release.yml 里没有调用浏览器冒烟');
