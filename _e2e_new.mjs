@@ -108,10 +108,19 @@ const BASE = process.env.BASE_URL || 'http://localhost:8080/index.html';
       { name: 'cs.txt', mimeType: 'text/plain', buffer: Buffer.from('SECRET a\nsecret b\nSecret c\n') },
     ]);
     await page.waitForTimeout(500);
+    // 日志是「只追加、不清空」的，所以不能等「出现过 扫描完成」——
+    // 上一次扫描留下的那条会立刻满足条件，于是在新扫描出结果前就读了旧命中数。
+    // （playwright 1.48 的轮询较慢，恰好把这段竞态掩盖住了；升到 1.55 才暴露。）
+    // 正确做法：记下点击前的完成次数，等它增加。
+    const doneCount = () => page.evaluate(
+      () => ((document.getElementById('log').textContent || '').match(/扫描完成/g) || []).length
+    );
     const hitsNow = async () => {
+      const before = await doneCount();
       await page.click('#scanBtn');
       await page.waitForFunction(
-        () => /扫描完成/.test(document.getElementById('log').textContent || ''),
+        (n) => ((document.getElementById('log').textContent || '').match(/扫描完成/g) || []).length > n,
+        before,
         { timeout: 60000 }
       );
       const t = await page.locator('#fileBody tr td:nth-child(5)').first().textContent();
