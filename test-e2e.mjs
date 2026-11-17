@@ -163,6 +163,54 @@ async function auditScrolledHeader(page, theme) {
   const title = await page.title();
   if (!/Doc|文档|Word|Remover/i.test(title)) throw new Error('页面标题异常: ' + title);
 
+  // v4.98.2 浏览器侧模块接线断言。
+  //   这类缺陷只有真浏览器能暴露：模块文件写好了、Node 侧测试也全绿，
+  //   但忘了把 <script src="js/xxx.js"> 加进 index.html —— 页面里对应的
+  //   全局对象就是 undefined，功能形同虚设。
+  //   v4.95 就踩过这个坑：js/ocrsuspect.js 只存在于工作区、没进页面，
+  //   网页端的「OCR 识别不可靠」判定完全没生效，而当时所有 Node 测试都通过。
+  {
+    const mods = await page.evaluate(() => ({
+      DWROcr: typeof window.DWROcr,
+      DWROcrSuspect: typeof window.DWROcrSuspect,
+      DWRDoc: typeof window.DWRDoc,
+      DWRRules: typeof window.DWRRules,
+      DWRZip: typeof window.DWRZip,
+      DWRReport: typeof window.DWRReport,
+      DWRReportDocx: typeof window.DWRReportDocx,
+      DWRReportXml: typeof window.DWRReportXml,
+      DWRReportHtml: typeof window.DWRReportHtml,
+    }));
+    const missing = Object.entries(mods).filter(([, v]) => v !== 'object' && v !== 'function');
+    if (missing.length) {
+      throw new Error('页面里缺少模块：' + missing.map(([k]) => k).join('、') +
+        '（多半是 js/*.js 没写进 index.html 的 <script> 列表）');
+    }
+    // OCR 可信度判定必须在浏览器里真的能算：中文里混进拉丁串 → 不可靠；
+    // 正常中文 → 可靠；PDF 这类缩写不误伤。
+    const suspect = await page.evaluate(() => {
+      const c = window.DWROcrSuspect.check;
+      return {
+        mixed: c('内部 PDF 机密 ULE'),
+        clean: c('内部文件机密'),
+        abbr: c('内部 PDF 机密'),
+      };
+    });
+    // check 返回 { ok, cjk, reasons }：ok=false 才表示不可靠
+    if (suspect.mixed.ok !== false || !suspect.mixed.reasons.some((x) => x.kind === 'latin')) {
+      throw new Error('OCR 可信度判定：中文混拉丁串应判为不可靠，实际 ' +
+        JSON.stringify(suspect.mixed));
+    }
+    if (suspect.clean.ok !== true) {
+      throw new Error('OCR 可信度判定：正常中文被误判为不可靠，实际 ' +
+        JSON.stringify(suspect.clean));
+    }
+    if (suspect.abbr.ok !== true) {
+      throw new Error('OCR 可信度判定：PDF 缩写被误判为不可靠，实际 ' +
+        JSON.stringify(suspect.abbr));
+    }
+  }
+
   const ruleChips = await page.locator('#ruleChips .chip').evaluateAll((chips) => chips.map((chip) => ({
     text: chip.textContent.trim(),
     tip: chip.getAttribute('data-tip'),

@@ -29,14 +29,13 @@ jobs:
 
       - name: Install Playwright
         run: |
-          npm init -y >/dev/null 2>&1
-          npm i -D playwright@1.48.0 >/dev/null 2>&1
-          npx playwright install --with-deps chromium
-
-      - name: Start static server
-        run: |
-          python3 -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &
-          sleep 2
+          # playwright 的版本由 tools/run-e2e.mjs 统一决定（唯一事实源），
+          # 这里不写死版本号，免得两处各写一份、各漂移。
+          # 顺带修掉了原先「重置 package.json 再装依赖」的老写法：那会把仓库的
+          # package.json 覆盖成空壳（CI 里虽不影响结果，但等于没测真实的配置）。
+          PW_VER=$(node tools/run-e2e.mjs --print-version)
+          echo "playwright@$PW_VER"
+          npx --yes "playwright@$PW_VER" install --with-deps chromium
 
       - name: Run E2E smoke
-        run: node test-e2e.mjs
+        run: node tools/run-e2e.mjs

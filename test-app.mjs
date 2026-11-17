@@ -579,6 +579,44 @@ const D = ctx.window;
         testAt >= 0 && injectAt >= 0 && testAt < injectAt,
         'release.yml 里测试步骤缺失，或被放到了版本注入之后');
     }
+
+    // v4.98.2 发版必须跑浏览器端冒烟。
+    //   发布出去的正是网页版，而「模块没写进 index.html」「页面里某个全局对象
+    //   是 undefined」这类问题 Node 侧测试全绿也照样存在——v4.95 就踩过
+    //   js/ocrsuspect.js 只在工作区、没进页面的坑，网页端的判定完全没生效。
+    //   于是发版流程里加一步浏览器冒烟，且必须排在版本注入之后
+    //   （测的就是即将发布的那份 index.html）。
+    {
+      const runner = path.join(__dirname, 'tools', 'run-e2e.mjs');
+      const RL3 = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'release.yml'), 'utf8');
+      const E2EY = fs.readFileSync(path.join(__dirname, '.github', 'workflows', 'e2e.yml'), 'utf8');
+      const hasRunner = fs.existsSync(runner);
+      check('v4982-存在统一的浏览器冒烟入口', hasRunner, 'tools/run-e2e.mjs 缺失');
+      if (hasRunner) {
+        const RS = fs.readFileSync(runner, 'utf8');
+        check('v4982-冒烟入口自带静态服务器（不依赖 python）',
+          /createServer/.test(RS) && /\.listen\(/.test(RS) && !/spawn\(\s*['"]python/.test(RS),
+          'tools/run-e2e.mjs 里没有内置静态服务器');
+        check('v4982-冒烟入口版本号是唯一事实源',
+          /PLAYWRIGHT_VERSION/.test(RS) && /--print-version/.test(RS)
+            && /devDependencies/.test(RS) && !/playwright@['"]\s*\d/.test(RS),
+          'tools/run-e2e.mjs 没有导出 playwright 版本');
+        // 版本号只能在 package.json 里写死一处：脚本里再写一遍就会各漂移
+        const PW = JSON.parse(PK).devDependencies && JSON.parse(PK).devDependencies.playwright;
+        check('v4982-playwright 版本只写在 package.json 一处',
+          !!PW && !/playwright@[\d.]/.test(RS),
+          'package.json 缺 playwright 版本，或脚本里又写死了一份');
+        check('v4982-发版流程跑浏览器冒烟',
+          RL3.indexOf('tools/run-e2e.mjs') >= 0,
+          'release.yml 里没有调用浏览器冒烟');
+        check('v4982-浏览器冒烟排在版本注入之后',
+          RL3.indexOf('tools/run-e2e.mjs') > RL3.indexOf('Inject version into page'),
+          '浏览器冒烟必须测注入版本号之后的那份 index.html');
+      }
+      check('v4982-E2E 工作流也走同一个入口',
+        E2EY.indexOf('tools/run-e2e.mjs') >= 0 && !/npm init -y/.test(E2EY),
+        'e2e.yml 还在各写一套（可能覆盖 package.json）');
+    }
   }
 
   // v4.98.1 第三方资源合规门禁：随包分发的 OCR 资源必须带齐许可与来源声明。

@@ -105,10 +105,14 @@ Node.js 18 or newer is required.
 
 ```bash
 npm test
-node test-e2e.mjs
+node tools/run-e2e.mjs
 ```
 
-The Playwright smoke test requires Chromium.
+`node tools/run-e2e.mjs` is the browser smoke test: it starts its own static
+server (no Python needed) and installs Playwright if it is missing. It loads
+the page in a real browser, scans samples, verifies that the exported text and
+Word files are actually cleaned, and asserts that every page module is wired
+up. The release workflow runs it before packaging.
 
 ## License
 

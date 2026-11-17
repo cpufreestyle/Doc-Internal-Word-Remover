@@ -35,6 +35,17 @@ jobs:
         run: |
           sed -i "s/__DWR_VERSION__/${GITHUB_REF_NAME}/" index.html
 
+      # 浏览器端冒烟：发出去的正是网页版，只跑 Node 侧测试是不够的——
+      # 「模块没写进 index.html」「页面里某个全局对象是 undefined」这类问题
+      # 只有真浏览器能暴露（v4.95 就踩过 js/ocrsuspect.js 没进页面的坑）。
+      # 放在版本注入之后，测的就是即将发布的那份 index.html。
+      - name: Browser smoke test
+        run: |
+          PW_VER=$(node tools/run-e2e.mjs --print-version)
+          echo "playwright@$PW_VER"
+          npx --yes "playwright@$PW_VER" install --with-deps chromium
+          node tools/run-e2e.mjs
+
       - name: Embed icon into launcher
         run: |
           # 给 启动工具.exe 嵌入程序图标与清单（EXE 在资源管理器 / 任务栏显示的图标）

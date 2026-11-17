@@ -172,12 +172,17 @@ node scan.mjs --from-report report.json \
 
 ```bash
 npm test
-node test-e2e.mjs
+node tools/run-e2e.mjs
 ```
 
-`npm test` 覆盖格式处理、规则匹配、报告解析、并发、界面逻辑和安全边界。Playwright 冒烟测试需要 Chromium。
+`npm test` 覆盖格式处理、规则匹配、报告解析、并发、界面逻辑和安全边界。
 
-版本变更见 `CHANGELOG.md（22 条版本记录）`。
+`node tools/run-e2e.mjs` 是浏览器端冒烟测试：自带静态服务器（不需要 python），
+缺 Playwright 会自动安装。它在真实浏览器里加载页面、扫描样本、校验导出的
+文本与 Word 确实已脱敏，并断言页面里的各个模块都已正确接线。
+发版流程会在打包前跑一遍它。
+
+版本变更见 `CHANGELOG.md（23 条版本记录）`。
 
 ## 许可
 

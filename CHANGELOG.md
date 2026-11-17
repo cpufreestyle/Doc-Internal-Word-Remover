@@ -1,5 +1,37 @@
 # Changelog
 
+## v4.98.2 - 2026-11-17
+
+- **发版流程加入浏览器端冒烟**（本版核心）：发出去的正是网页版，
+  但发版流程此前只跑 Node 侧测试——「模块没写进 `index.html`」「页面里某个
+  全局对象是 undefined」这类问题，Node 测试全绿也照样存在。
+  v4.95 就踩过这个坑：`js/ocrsuspect.js` 只存在于工作区、没进页面，
+  网页端的「OCR 识别不可靠」判定完全没生效，而当时所有 Node 测试都通过。
+  现在 `release.yml` 在**版本注入之后**跑一遍真实浏览器冒烟——
+  测的就是即将发布的那份 `index.html`。
+- **浏览器端新增模块接线断言**（`test-e2e.mjs`）：断言页面里
+  `DWROcr` / `DWROcrSuspect` / `DWRDoc` / `DWRRules` / `DWRZip` /
+  `DWRReport` / `DWRReportDocx` / `DWRReportXml` / `DWRReportHtml`
+  全部存在（缺一个就报出是哪个模块没进 `<script>` 列表），
+  并在浏览器里实算一遍 OCR 可信度判定（中文混拉丁串 → 不可靠、
+  正常中文 → 可靠、PDF 缩写不误伤）。
+- **浏览器冒烟收敛成统一入口**（`tools/run-e2e.mjs`）：
+  - 自带静态服务器，**不再依赖 python / python3**（Windows、CI、UOS 都能跑）；
+  - playwright 的版本只写在 `package.json` 一处，CI 与发版流程都从这里取
+    （`--print-version`），不会各写一份、各漂移；
+  - 缺 playwright 时自动安装，Windows 上处理了 `npm` / `npx` 的
+    `.cmd` 与 `shell` 差异；
+  - 用异步 `spawn` 跑测试：原先用 `spawnSync` 会卡住本进程的事件循环，
+    同进程的静态服务器压根没法响应，浏览器只能等到超时。
+- **修掉 E2E 工作流里的一个坏写法**：原先会先「重置 `package.json`」再装依赖，
+  等于把仓库真实的 `package.json` 覆盖成空壳——CI 里虽不影响结果，
+  但等于没测真实的配置。现在只按需安装 playwright，不动仓库配置。
+- **回归测试补 7 条**（`test-app.mjs` 的 v4982 区块）：统一入口存在、
+  自带静态服务器、版本号唯一事实源、版本只写在 package.json 一处、
+  发版流程跑浏览器冒烟、冒烟排在版本注入之后、E2E 工作流走同一入口。
+  已做反向验证：把发版流程里的冒烟步骤删掉，门禁立即报红。
+- `package.json`：`playwright` 固定为 `1.48.0` 并入 `devDependencies`。
+
 ## v4.98.1 - 2026-11-16
 
 - **补上随包 OCR 资源的第三方许可声明**（本版核心）：

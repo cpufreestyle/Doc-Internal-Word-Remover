@@ -1,6 +1,6 @@
 {
   "name": "doc-internal-word-remover",
-  "version": "4.98.1",
+  "version": "4.98.2",
   "private": true,
   "description": "文档敏感词清除工具：Word/Excel/PowerPoint 与文本文件的敏感词扫描、清除与报告解析（零运行时依赖）",
   "license": "MIT",
@@ -34,6 +34,7 @@
     "scan": "node scan.mjs"
   },
   "devDependencies": {
+    "playwright": "1.48.0",
     "tesseract.js": "^7.0.0",
     "tesseract.js-core": "^6.1.2"
   }
