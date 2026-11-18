@@ -53,8 +53,18 @@
     var maxBytes = options.maxBytes > 0 ? options.maxBytes : DEFAULT_LIMITS.maxEntryBytes;
     var budget = options.budget || null;
     var ds = new global.DecompressionStream('deflate-raw');
-    var stream = new Blob([data]).stream().pipeThrough(ds);
-    var reader = stream.getReader();
+    // v4.98.4：不再用 `new Blob([data]).stream().pipeThrough(ds)`。
+    // 那条链路上，压缩流出错时 Node 会额外抛出一个「无人监听」的 error 事件
+    // （handleKnownInternalErrors / Z_DATA_ERROR），文件级 try/catch 拦不住它，
+    // 结果整轮扫描在收尾阶段被未捕获异常打断、进程带错退出。
+    // 改成直接写 writer：写侧的失败由 pumpPromise 兜住，读侧的失败由
+    // reader.read() 的 reject 抛出，两条错误都变成同一个可捕获的异常。
+    var writer = ds.writable.getWriter();
+    var reader = ds.readable.getReader();
+    var pumpPromise = (function () {
+      return writer.write(data).then(function () { return writer.close(); });
+    })();
+    pumpPromise.catch(function () { /* 错误统一由 reader.read() 抛出，这里只负责吞掉未处理的拒绝 */ });
     var chunks = [];
     var total = 0;
     function pump() {
@@ -84,7 +94,16 @@
     return pump().then(function (out) {
       return out;
     }, function (err) {
-      try { reader.cancel(); } catch (e) {}
+      // v4.98.4：cancel() 返回的 Promise 会被拒绝（流已出错），
+      // 之前没人接这个拒绝，Node 会把它升级成未捕获异常，
+      // 整个扫描进程在收尾阶段崩溃退出（Z_DATA_ERROR）。
+      // 这里把拒绝吞掉，真正的错误由上面 throw err 交给调用方处理。
+      try {
+        var cancelled = reader.cancel();
+        if (cancelled && typeof cancelled.catch === 'function') {
+          cancelled.catch(function () {});
+        }
+      } catch (e) {}
       throw err;
     });
   }

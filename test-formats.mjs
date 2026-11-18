@@ -2740,6 +2740,109 @@ const presetsEngine = D.DWRRules.createEngine({
     }])));
 }
 
+/* ================= D. 损坏的 OOXML 压缩流：不得中断整轮扫描 ================= */
+{
+  // v4.98.4：解压条目失败时，reader.cancel() 返回的 Promise 被拒绝且没人接，
+  // Node 把它升级成未捕获异常，扫描进程在收尾阶段带错退出——
+  // 一个坏文件就能让整轮扫描（乃至整个盘）白跑。这里锁住两条：
+  //   1) 单元层：inflateRaw 对损坏流走 reject，不产生未捕获异常；
+  //   2) 端到端：scan.mjs 遇到损坏 docx 仍跑完、出报告、退出码为 0。
+  function crc32(buf) {
+    let table = [];
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+      table[n] = c >>> 0;
+    }
+    let crc = 0xffffffff;
+    for (const b of buf) crc = table[(crc ^ b) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  /** 拼一个 ZIP：word/document.xml 用 deflateRaw 压，再故意破坏几个字节 */
+  function buildCorruptDocx() {
+    const name = Buffer.from('word/document.xml', 'utf8');
+    const content = Buffer.from('<w:p>内部 秘密 机密</w:p>'.repeat(40), 'utf8');
+    const comp = Buffer.from(zlib.deflateRawSync(content));
+    comp[3] ^= 0xff;
+    comp[11] ^= 0x5a;
+
+    const lfh = Buffer.alloc(30);
+    lfh.writeUInt32LE(0x04034b50, 0);
+    lfh.writeUInt16LE(20, 4);
+    lfh.writeUInt16LE(8, 8);              // 压缩方式 = deflate
+    lfh.writeUInt32LE(crc32(content), 14);
+    lfh.writeUInt32LE(comp.length, 18);
+    lfh.writeUInt32LE(content.length, 22);
+    lfh.writeUInt16LE(name.length, 26);
+    name.copy(lfh, 30);
+
+    const cd = Buffer.alloc(46 + name.length);
+    cd.writeUInt32LE(0x02014b50, 0);
+    cd.writeUInt16LE(20, 4);
+    cd.writeUInt16LE(20, 6);
+    cd.writeUInt16LE(8, 10);
+    cd.writeUInt32LE(crc32(content), 16);
+    cd.writeUInt32LE(comp.length, 20);
+    cd.writeUInt32LE(content.length, 24);
+    cd.writeUInt16LE(name.length, 28);
+    cd.writeUInt32LE(lfh.length + comp.length, 42);
+    name.copy(cd, 46);
+
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(1, 8);
+    eocd.writeUInt16LE(1, 10);
+    eocd.writeUInt32LE(cd.length, 12);
+    eocd.writeUInt32LE(lfh.length + comp.length, 16);
+
+    return Buffer.concat([lfh, comp, cd, eocd]);
+  }
+
+  const corrupt = buildCorruptDocx();
+
+  // 1) 单元层：损坏流必须走 reject，且不产生未捕获异常
+  let rejected = false;
+  let uncaught = null;
+  const onUncaught = (e) => { uncaught = e; };
+  process.on('uncaughtException', onUncaught);
+  try {
+    await D.DWRZip.inflateRaw(corrupt).then(
+      () => { /* 不该成功 */ },
+      () => { rejected = true; }
+    );
+    // 未捕获异常是异步冒出来的，留一拍窗口再看
+    await new Promise((r) => setTimeout(r, 60));
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
+  }
+  check('v4984-损坏压缩流让 inflateRaw 走 reject', rejected, 'rejected=' + rejected);
+  check('v4984-损坏压缩流不产生未捕获异常', uncaught === null,
+    uncaught ? String(uncaught && uncaught.message) + ' / ' + String(uncaught && uncaught.cause && uncaught.cause.code) : '');
+
+  // 2) 端到端：坏 docx 不得打断整轮扫描
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dwr-corrupt-'));
+  try {
+    fs.writeFileSync(path.join(base, 'broken.docx'), corrupt);
+    fs.writeFileSync(path.join(base, 'good.txt'), '内部首行\n正文\n机密尾行\n', 'utf8');
+    const report = path.join(base, 'report.json');
+    const rr = spawnSync(process.execPath, [
+      path.join(__dirname, 'scan.mjs'), '--dir', base, '--json', '--report', report
+    ], { cwd: __dirname, encoding: 'utf8' });
+    const outText = (rr.stdout || '') + (rr.stderr || '');
+    check('v4984-损坏 docx 不中断整轮扫描（退出码 0 且跑完）',
+      rr.status === 0 && /扫描完成/.test(outText) && !/Z_DATA_ERROR/.test(outText),
+      'status=' + rr.status + ' ' + outText.slice(-300));
+    check('v4984-损坏 docx 只记为处理失败，同批正常文件仍被扫出',
+      /处理失败/.test(outText) && /命中文档数 : 1/.test(outText),
+      outText.slice(-300));
+    check('v4984-损坏 docx 场景仍写出 JSON 报告',
+      fs.existsSync(report), (rr.stderr || '').slice(0, 200));
+  } finally {
+    try { fs.rmSync(base, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+  }
+}
+
 console.log('\n==== ' + (fail === 0 ? '全部通过' : '存在失败') + ' ====');
 console.log('PASS: ' + pass + '  FAIL: ' + fail);
 process.exit(fail === 0 ? 0 : 1);
